@@ -98,6 +98,71 @@ fn full_cli_flow_tracks_history() {
 }
 
 #[test]
+fn session_delete_requires_confirmation_and_removes_finished_session() {
+    let app = TestApp::new();
+
+    let gym = app.json(&["gym", "add", "--name", "Main Gym"]);
+    let gym_id = gym["id"].as_i64().unwrap();
+    let exercise = app.json(&[
+        "exercise",
+        "add",
+        "--name",
+        "Squat",
+        "--kind",
+        "freeweight",
+        "--tag",
+        "quad",
+    ]);
+    let exercise_id = exercise["id"].as_i64().unwrap();
+    let session = app.json(&["session", "start", "--gym", &gym_id.to_string()]);
+    let session_id = session["id"].as_str().unwrap().to_string();
+    assert_eq!(session_id.len(), 36);
+    let session_date = &session["started_at"].as_str().unwrap()[..10];
+    let entry = app.json(&["log", "exercise", &exercise_id.to_string()]);
+    let entry_id = entry["entry"]["id"].as_i64().unwrap();
+    app.cmd()
+        .args([
+            "log",
+            "set",
+            "--exercise-entry",
+            &entry_id.to_string(),
+            "--reps",
+            "5",
+            "--weight",
+            "100",
+            "--unit",
+            "kg",
+        ])
+        .assert()
+        .success();
+    app.cmd().args(["session", "finish"]).assert().success();
+
+    app.cmd()
+        .args(["session", "delete", &session_id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--yes"));
+
+    app.cmd()
+        .args(["session", "list", "--date", session_date])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&session_id));
+
+    app.cmd()
+        .args(["session", "delete", &session_id, "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("deleted session"));
+
+    app.cmd()
+        .args(["session", "delete", &session_id, "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not found"));
+}
+
+#[test]
 fn log_exercise_suggests_similar_names_without_resolving() {
     let app = TestApp::new();
 

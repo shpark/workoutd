@@ -5,6 +5,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use uuid::Uuid;
 
 pub const ALLOWED_TAGS: &[&str] = &[
     "biceps",
@@ -127,7 +128,7 @@ pub struct Exercise {
 
 #[derive(Debug, Serialize)]
 pub struct Session {
-    pub id: i64,
+    pub id: String,
     pub gym_id: i64,
     pub gym_name: String,
     pub started_at: String,
@@ -138,7 +139,7 @@ pub struct Session {
 #[derive(Debug, Serialize)]
 pub struct SessionExercise {
     pub id: i64,
-    pub session_id: i64,
+    pub session_id: String,
     pub exercise_id: i64,
     pub exercise_name: String,
     pub kind: ExerciseKind,
@@ -162,11 +163,16 @@ pub struct SetEntry {
 
 #[derive(Debug, Serialize)]
 pub struct HistoryEntry {
-    pub session_id: i64,
+    pub session_id: String,
     pub session_date: String,
     pub gym_name: String,
     pub machine_name: Option<String>,
     pub sets: Vec<SetEntry>,
+}
+
+struct SessionRecord {
+    row_id: i64,
+    session: Session,
 }
 
 #[derive(Debug, Serialize)]
@@ -273,6 +279,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
 
         CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY,
+            uuid TEXT NOT NULL UNIQUE,
             gym_id INTEGER NOT NULL REFERENCES gyms(id),
             started_at TEXT NOT NULL DEFAULT (datetime('now')),
             finished_at TEXT,
@@ -307,12 +314,36 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    ensure_session_uuid_column(conn)?;
     seed_allowed_tags(conn)?;
     Ok(())
 }
 
 pub fn health_check(conn: &Connection) -> Result<()> {
     conn.query_row("SELECT 1", [], |_| Ok(()))?;
+    Ok(())
+}
+
+fn ensure_session_uuid_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+    let columns = collect_rows(stmt.query_map([], |row| row.get::<_, String>(1))?)?;
+    if !columns.iter().any(|column| column == "uuid") {
+        conn.execute("ALTER TABLE sessions ADD COLUMN uuid TEXT", [])?;
+    }
+
+    let mut stmt = conn.prepare("SELECT id FROM sessions WHERE uuid IS NULL OR uuid = ''")?;
+    let missing_ids = collect_rows(stmt.query_map([], |row| row.get::<_, i64>(0))?)?;
+    for id in missing_ids {
+        conn.execute(
+            "UPDATE sessions SET uuid = ?1 WHERE id = ?2",
+            params![Uuid::new_v4().to_string(), id],
+        )?;
+    }
+
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS sessions_uuid_unique ON sessions(uuid)",
+        [],
+    )?;
     Ok(())
 }
 
@@ -714,9 +745,10 @@ pub fn restore_exercise(conn: &Connection, id: i64) -> Result<()> {
 
 pub fn start_session(conn: &Connection, gym_id: i64, notes: Option<&str>) -> Result<Session> {
     require_active_gym(conn, gym_id)?;
+    let uuid = Uuid::new_v4().to_string();
     conn.execute(
-        "INSERT INTO sessions (gym_id, notes) VALUES (?1, ?2)",
-        params![gym_id, empty_to_none(notes)],
+        "INSERT INTO sessions (uuid, gym_id, notes) VALUES (?1, ?2, ?3)",
+        params![uuid, gym_id, empty_to_none(notes)],
     )
     .map_err(|err| {
         if is_unique_error(&err) {
@@ -725,40 +757,61 @@ pub fn start_session(conn: &Connection, gym_id: i64, notes: Option<&str>) -> Res
             anyhow!(err)
         }
     })?;
-    get_session(conn, conn.last_insert_rowid())
+    get_session_by_row_id(conn, conn.last_insert_rowid())
 }
 
 pub fn current_session(conn: &Connection) -> Result<Option<Session>> {
-    conn.query_row(
-        "SELECT s.id, s.gym_id, g.name, s.started_at, s.finished_at, s.notes
-         FROM sessions s JOIN gyms g ON g.id = s.gym_id
-         WHERE s.finished_at IS NULL",
-        [],
-        map_session,
-    )
-    .optional()
-    .map_err(Into::into)
+    Ok(current_session_record(conn)?.map(|record| record.session))
 }
 
 pub fn finish_session(conn: &Connection, notes: Option<&str>) -> Result<Session> {
-    let session = current_session(conn)?.ok_or_else(|| anyhow!("no active session"))?;
+    let active = current_session_record(conn)?.ok_or_else(|| anyhow!("no active session"))?;
     if let Some(notes) = notes {
         conn.execute(
             "UPDATE sessions SET notes = ?1 WHERE id = ?2",
-            params![empty_to_none(Some(notes)), session.id],
+            params![empty_to_none(Some(notes)), active.row_id],
         )?;
     }
     conn.execute(
         "UPDATE sessions SET finished_at = datetime('now') WHERE id = ?1",
-        [session.id],
+        [active.row_id],
     )?;
-    get_session(conn, session.id)
+    get_session_by_row_id(conn, active.row_id)
 }
 
 pub fn cancel_session(conn: &Connection) -> Result<()> {
-    let session = current_session(conn)?.ok_or_else(|| anyhow!("no active session"))?;
-    conn.execute("DELETE FROM sessions WHERE id = ?1", [session.id])?;
+    let active = current_session_record(conn)?.ok_or_else(|| anyhow!("no active session"))?;
+    conn.execute("DELETE FROM sessions WHERE id = ?1", [active.row_id])?;
     Ok(())
+}
+
+pub fn delete_session(conn: &Connection, session_id: &str) -> Result<Session> {
+    let record = get_session_record_by_uuid(conn, session_id)?;
+    conn.execute("DELETE FROM sessions WHERE id = ?1", [record.row_id])?;
+    Ok(record.session)
+}
+
+pub fn list_sessions(conn: &Connection, date: Option<&str>) -> Result<Vec<Session>> {
+    if let Some(date) = date {
+        validate_date(date)?;
+    }
+    let sql = if date.is_some() {
+        "SELECT s.id, s.uuid, s.gym_id, g.name, s.started_at, s.finished_at, s.notes
+         FROM sessions s JOIN gyms g ON g.id = s.gym_id
+         WHERE date(s.started_at) = ?1 OR date(s.started_at, 'localtime') = ?1
+         ORDER BY s.started_at DESC"
+    } else {
+        "SELECT s.id, s.uuid, s.gym_id, g.name, s.started_at, s.finished_at, s.notes
+         FROM sessions s JOIN gyms g ON g.id = s.gym_id
+         ORDER BY s.started_at DESC"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let records = if let Some(date) = date {
+        collect_rows(stmt.query_map([date], map_session_record)?)?
+    } else {
+        collect_rows(stmt.query_map([], map_session_record)?)?
+    };
+    Ok(records.into_iter().map(|record| record.session).collect())
 }
 
 pub fn log_exercise(
@@ -769,7 +822,7 @@ pub fn log_exercise(
     machine_note: Option<&str>,
     history_limit: usize,
 ) -> Result<LogExerciseResult> {
-    let session = current_session(conn)?.ok_or_else(|| anyhow!("no active session"))?;
+    let active = current_session_record(conn)?.ok_or_else(|| anyhow!("no active session"))?;
     let exercise = get_exercise(conn, exercise_id)?;
     if exercise.archived_at.is_some() {
         bail!("exercise {} is archived", exercise_id);
@@ -783,11 +836,11 @@ pub fn log_exercise(
             if machine.archived_at.is_some() {
                 bail!("machine {} is archived", machine_id);
             }
-            if machine.gym_id != session.gym_id {
+            if machine.gym_id != active.session.gym_id {
                 bail!(
                     "machine {} does not belong to active session gym {}",
                     machine_id,
-                    session.gym_id
+                    active.session.gym_id
                 );
             }
         }
@@ -798,14 +851,14 @@ pub fn log_exercise(
 
     let position: i64 = conn.query_row(
         "SELECT COALESCE(MAX(position), 0) + 1 FROM session_exercises WHERE session_id = ?1",
-        [session.id],
+        [active.row_id],
         |row| row.get(0),
     )?;
     conn.execute(
         "INSERT INTO session_exercises (session_id, exercise_id, machine_id, position, notes)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
-            session.id,
+            active.row_id,
             exercise_id,
             machine_id,
             position,
@@ -820,7 +873,7 @@ pub fn log_exercise(
     }
     Ok(LogExerciseResult {
         entry: get_session_exercise(conn, entry_id)?,
-        history: previous_history(conn, exercise_id, session.id, history_limit)?,
+        history: previous_history(conn, exercise_id, active.row_id, history_limit)?,
         machine_notes: machine_id
             .map(|machine_id| {
                 previous_machine_notes(conn, machine_id, history_limit.max(1), Some(entry_id))
@@ -831,10 +884,10 @@ pub fn log_exercise(
 }
 
 pub fn latest_session_exercise_id(conn: &Connection) -> Result<i64> {
-    let session = current_session(conn)?.ok_or_else(|| anyhow!("no active session"))?;
+    let active = current_session_record(conn)?.ok_or_else(|| anyhow!("no active session"))?;
     conn.query_row(
         "SELECT id FROM session_exercises WHERE session_id = ?1 ORDER BY position DESC LIMIT 1",
-        [session.id],
+        [active.row_id],
         |row| row.get(0),
     )
     .optional()?
@@ -857,7 +910,7 @@ pub fn log_set(
         _ => bail!("weight and unit must be provided together"),
     }
 
-    let active = current_session(conn)?.ok_or_else(|| anyhow!("no active session"))?;
+    let active = current_session_record(conn)?.ok_or_else(|| anyhow!("no active session"))?;
     let entry_session_id: i64 = conn
         .query_row(
             "SELECT session_id FROM session_exercises WHERE id = ?1",
@@ -866,7 +919,7 @@ pub fn log_set(
         )
         .optional()?
         .ok_or_else(|| anyhow!("session exercise {} not found", session_exercise_id))?;
-    if entry_session_id != active.id {
+    if entry_session_id != active.row_id {
         bail!("sets can only be added to the active session");
     }
 
@@ -934,22 +987,52 @@ fn get_exercise(conn: &Connection, id: i64) -> Result<Exercise> {
     Ok(exercise)
 }
 
-fn get_session(conn: &Connection, id: i64) -> Result<Session> {
+fn get_session_by_row_id(conn: &Connection, id: i64) -> Result<Session> {
+    Ok(get_session_record_by_row_id(conn, id)?.session)
+}
+
+fn get_session_record_by_row_id(conn: &Connection, id: i64) -> Result<SessionRecord> {
     conn.query_row(
-        "SELECT s.id, s.gym_id, g.name, s.started_at, s.finished_at, s.notes
+        "SELECT s.id, s.uuid, s.gym_id, g.name, s.started_at, s.finished_at, s.notes
          FROM sessions s JOIN gyms g ON g.id = s.gym_id
          WHERE s.id = ?1",
         [id],
-        map_session,
+        map_session_record,
     )
     .optional()?
     .ok_or_else(|| anyhow!("session {} not found", id))
 }
 
+fn get_session_record_by_uuid(conn: &Connection, uuid: &str) -> Result<SessionRecord> {
+    let uuid = normalize_session_uuid(uuid)?;
+    conn.query_row(
+        "SELECT s.id, s.uuid, s.gym_id, g.name, s.started_at, s.finished_at, s.notes
+         FROM sessions s JOIN gyms g ON g.id = s.gym_id
+         WHERE s.uuid = ?1",
+        [uuid.as_str()],
+        map_session_record,
+    )
+    .optional()?
+    .ok_or_else(|| anyhow!("session {} not found", uuid))
+}
+
+fn current_session_record(conn: &Connection) -> Result<Option<SessionRecord>> {
+    conn.query_row(
+        "SELECT s.id, s.uuid, s.gym_id, g.name, s.started_at, s.finished_at, s.notes
+         FROM sessions s JOIN gyms g ON g.id = s.gym_id
+         WHERE s.finished_at IS NULL",
+        [],
+        map_session_record,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 fn get_session_exercise(conn: &Connection, id: i64) -> Result<SessionExercise> {
     conn.query_row(
-        "SELECT se.id, se.session_id, se.exercise_id, e.name, e.kind, se.machine_id, m.name, se.position, se.notes, se.created_at
+        "SELECT se.id, s.uuid, se.exercise_id, e.name, e.kind, se.machine_id, m.name, se.position, se.notes, se.created_at
          FROM session_exercises se
+         JOIN sessions s ON s.id = se.session_id
          JOIN exercises e ON e.id = se.exercise_id
          LEFT JOIN machines m ON m.id = se.machine_id
          WHERE se.id = ?1",
@@ -981,7 +1064,7 @@ fn previous_history(
         return Ok(Vec::new());
     }
     let mut stmt = conn.prepare(
-        "SELECT se.id, s.id, s.started_at, g.name, m.name
+        "SELECT se.id, s.uuid, s.started_at, g.name, m.name
          FROM session_exercises se
          JOIN sessions s ON s.id = se.session_id
          JOIN gyms g ON g.id = s.gym_id
@@ -997,7 +1080,7 @@ fn previous_history(
         |row| {
             Ok((
                 row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
+                row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, Option<String>>(4)?,
@@ -1198,6 +1281,26 @@ fn normalize_search(value: &str) -> String {
         .collect()
 }
 
+fn normalize_session_uuid(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    let uuid = Uuid::parse_str(trimmed).map_err(|_| anyhow!("session id must be a UUID"))?;
+    Ok(uuid.to_string())
+}
+
+fn validate_date(value: &str) -> Result<()> {
+    let bytes = value.as_bytes();
+    let valid = bytes.len() == 10
+        && bytes[0..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit);
+    if !valid {
+        bail!("date must be in YYYY-MM-DD format");
+    }
+    Ok(())
+}
+
 fn fuzzy_score(query: &str, candidate: &str) -> Option<usize> {
     let query = normalize_search(query);
     let candidate = normalize_search(candidate);
@@ -1325,14 +1428,17 @@ fn map_exercise_without_tags(row: &Row<'_>) -> rusqlite::Result<Exercise> {
     })
 }
 
-fn map_session(row: &Row<'_>) -> rusqlite::Result<Session> {
-    Ok(Session {
-        id: row.get(0)?,
-        gym_id: row.get(1)?,
-        gym_name: row.get(2)?,
-        started_at: row.get(3)?,
-        finished_at: row.get(4)?,
-        notes: row.get(5)?,
+fn map_session_record(row: &Row<'_>) -> rusqlite::Result<SessionRecord> {
+    Ok(SessionRecord {
+        row_id: row.get(0)?,
+        session: Session {
+            id: row.get(1)?,
+            gym_id: row.get(2)?,
+            gym_name: row.get(3)?,
+            started_at: row.get(4)?,
+            finished_at: row.get(5)?,
+            notes: row.get(6)?,
+        },
     })
 }
 
@@ -1482,6 +1588,57 @@ mod tests {
         let second = log_exercise(&mutable, exercise.id, None, None, None, 1).unwrap();
         assert_eq!(second.history.len(), 1);
         assert_eq!(second.history[0].sets[0].reps, 8);
+    }
+
+    #[test]
+    fn delete_session_removes_finished_session_and_children() {
+        let conn = conn();
+        let mut mutable = conn;
+        let gym = add_gym(&mutable, "Main", None, None).unwrap();
+        let exercise =
+            add_exercise(&mut mutable, "Squat", ExerciseKind::Freeweight, &[], None).unwrap();
+
+        let session = start_session(&mutable, gym.id, None).unwrap();
+        let session_row_id: i64 = mutable
+            .query_row(
+                "SELECT id FROM sessions WHERE uuid = ?1",
+                [&session.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let entry = log_exercise(&mutable, exercise.id, None, None, None, 1).unwrap();
+        log_set(
+            &mutable,
+            entry.entry.id,
+            5,
+            Some(100.0),
+            Some(WeightUnit::Kg),
+        )
+        .unwrap();
+        finish_session(&mutable, None).unwrap();
+
+        let deleted = delete_session(&mutable, &session.id).unwrap();
+        assert_eq!(deleted.id, session.id);
+        let remaining: i64 = mutable
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE uuid = ?1",
+                [&session.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let remaining_entries: i64 = mutable
+            .query_row(
+                "SELECT COUNT(*) FROM session_exercises WHERE session_id = ?1",
+                [session_row_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let remaining_sets: i64 = mutable
+            .query_row("SELECT COUNT(*) FROM sets", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+        assert_eq!(remaining_entries, 0);
+        assert_eq!(remaining_sets, 0);
     }
 
     #[test]

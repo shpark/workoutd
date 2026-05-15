@@ -6,12 +6,12 @@ use std::str::FromStr;
 use workoutd::{
     add_exercise, add_gym, add_machine, add_machine_note, archive_exercise, archive_gym,
     archive_machine, archive_machine_note, cancel_session, current_session, default_db_path,
-    find_exercise_exact, find_machine_exact_for_gym, finish_session, latest_session_exercise_id,
-    list_allowed_tags, list_exercises, list_gyms, list_machine_notes, list_machines, log_exercise,
-    log_set, open_database, restore_exercise, restore_gym, restore_machine, restore_machine_note,
-    start_session, suggest_exercises, suggest_machines_for_gym, update_exercise, ExerciseKind,
-    ExerciseSuggestion, HistoryEntry, LogExerciseResult, MachineNote, MachineSuggestion, SetEntry,
-    WeightUnit,
+    delete_session, find_exercise_exact, find_machine_exact_for_gym, finish_session,
+    latest_session_exercise_id, list_allowed_tags, list_exercises, list_gyms, list_machine_notes,
+    list_machines, list_sessions, log_exercise, log_set, open_database, restore_exercise,
+    restore_gym, restore_machine, restore_machine_note, start_session, suggest_exercises,
+    suggest_machines_for_gym, update_exercise, ExerciseKind, ExerciseSuggestion, HistoryEntry,
+    LogExerciseResult, MachineNote, MachineSuggestion, Session, SetEntry, WeightUnit,
 };
 
 #[derive(Parser)]
@@ -48,7 +48,7 @@ enum Command {
         #[command(subcommand)]
         command: TagCommand,
     },
-    #[command(about = "Start, inspect, finish, or cancel the active session")]
+    #[command(about = "Start, list, inspect, finish, cancel, or delete sessions")]
     Session {
         #[command(subcommand)]
         command: SessionCommand,
@@ -213,12 +213,16 @@ struct ExerciseUpdate {
 enum SessionCommand {
     #[command(about = "Start a new session at a gym")]
     Start(SessionStart),
+    #[command(about = "List sessions, optionally filtered by date")]
+    List(SessionList),
     #[command(about = "Show the active session")]
     Current,
     #[command(about = "Finish the active session")]
     Finish(SessionFinish),
     #[command(about = "Delete the active unfinished session")]
     Cancel,
+    #[command(about = "Delete any session by UUID")]
+    Delete(SessionDelete),
 }
 
 #[derive(Args)]
@@ -230,9 +234,25 @@ struct SessionStart {
 }
 
 #[derive(Args)]
+struct SessionList {
+    /// Filter sessions by started date in YYYY-MM-DD format.
+    #[arg(long)]
+    date: Option<String>,
+}
+
+#[derive(Args)]
 struct SessionFinish {
     #[arg(long)]
     notes: Option<String>,
+}
+
+#[derive(Args)]
+struct SessionDelete {
+    /// Session UUID from `workoutd session list` or session JSON output.
+    session_id: String,
+    /// Required confirmation for deleting a session and its logged exercises/sets.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Subcommand)]
@@ -502,6 +522,10 @@ fn main() -> Result<()> {
                     Ok(())
                 })
             }
+            SessionCommand::List(args) => {
+                let sessions = list_sessions(&conn, args.date.as_deref())?;
+                emit(cli.json, &sessions, || print_sessions(&sessions))
+            }
             SessionCommand::Current => {
                 let session = current_session(&conn)?;
                 emit(cli.json, &session, || {
@@ -526,6 +550,19 @@ fn main() -> Result<()> {
             SessionCommand::Cancel => {
                 cancel_session(&conn)?;
                 emit_status(cli.json, "cancelled", 0)
+            }
+            SessionCommand::Delete(args) => {
+                if !args.yes {
+                    bail!("deleting a session requires --yes");
+                }
+                let session = delete_session(&conn, &args.session_id)?;
+                emit(cli.json, &session, || {
+                    println!(
+                        "deleted session {} at {} started {}",
+                        session.id, session.gym_name, session.started_at
+                    );
+                    Ok(())
+                })
             }
         },
         Command::Log { command } => match command {
@@ -682,6 +719,25 @@ fn print_machine_notes(notes: &[MachineNote]) -> Result<()> {
             note.id,
             note.note,
             archived_suffix(&note.archived_at)
+        );
+    }
+    Ok(())
+}
+
+fn print_sessions(sessions: &[Session]) -> Result<()> {
+    if sessions.is_empty() {
+        println!("no sessions");
+        return Ok(());
+    }
+    for session in sessions {
+        let state = if session.finished_at.is_some() {
+            "finished"
+        } else {
+            "active"
+        };
+        println!(
+            "{}: {} started {} ({})",
+            session.id, session.gym_name, session.started_at, state
         );
     }
     Ok(())
