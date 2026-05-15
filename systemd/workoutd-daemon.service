@@ -1,0 +1,12 @@
+[Unit]
+Description=workoutd local database health service
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/workoutd-daemon
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
