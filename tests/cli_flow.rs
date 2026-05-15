@@ -50,7 +50,7 @@ fn full_cli_flow_tracks_history() {
         "--kind",
         "freeweight",
         "--tag",
-        "push",
+        "chest",
     ]);
     let exercise_id = exercise["id"].as_i64().unwrap();
 
@@ -95,6 +95,35 @@ fn full_cli_flow_tracks_history() {
             .unwrap(),
         5
     );
+}
+
+#[test]
+fn log_exercise_suggests_similar_names_without_resolving() {
+    let app = TestApp::new();
+
+    let gym = app.json(&["gym", "add", "--name", "Main Gym"]);
+    let gym_id = gym["id"].as_i64().unwrap();
+    app.json(&[
+        "exercise",
+        "add",
+        "--name",
+        "Bench Press",
+        "--kind",
+        "freeweight",
+        "--tag",
+        "chest",
+    ]);
+    app.cmd()
+        .args(["session", "start", "--gym", &gym_id.to_string()])
+        .assert()
+        .success();
+
+    app.cmd()
+        .args(["log", "exercise", "bench"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("similar exercises"))
+        .stderr(predicate::str::contains("Bench Press"));
 }
 
 #[test]
@@ -143,7 +172,98 @@ fn machine_exercise_rejects_machine_from_other_gym() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("does not belong"));
+        .stderr(predicate::str::contains("not found in active gym"));
+}
+
+#[test]
+fn machine_logging_suggests_only_active_gym_machines_and_shows_notes() {
+    let app = TestApp::new();
+
+    let gym_a = app.json(&["gym", "add", "--name", "A"]);
+    let gym_b = app.json(&["gym", "add", "--name", "B"]);
+    let gym_a_id = gym_a["id"].as_i64().unwrap();
+    let gym_b_id = gym_b["id"].as_i64().unwrap();
+
+    let active_machine = app.json(&[
+        "machine",
+        "add",
+        "--gym",
+        &gym_a_id.to_string(),
+        "--name",
+        "Leg Press A",
+        "--type",
+        "leg-press",
+    ]);
+    let active_machine_id = active_machine["id"].as_i64().unwrap();
+    app.json(&[
+        "machine",
+        "add",
+        "--gym",
+        &gym_b_id.to_string(),
+        "--name",
+        "Leg Press B",
+        "--type",
+        "leg-press",
+    ]);
+    app.cmd()
+        .args([
+            "machine",
+            "note",
+            "add",
+            &active_machine_id.to_string(),
+            "--note",
+            "seat 4",
+        ])
+        .assert()
+        .success();
+
+    let exercise = app.json(&[
+        "exercise",
+        "add",
+        "--name",
+        "Leg Press",
+        "--kind",
+        "machine",
+        "--tag",
+        "quad",
+    ]);
+    let exercise_id = exercise["id"].as_i64().unwrap();
+
+    app.cmd()
+        .args(["session", "start", "--gym", &gym_a_id.to_string()])
+        .assert()
+        .success();
+
+    app.cmd()
+        .args([
+            "log",
+            "exercise",
+            &exercise_id.to_string(),
+            "--machine",
+            "press",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Leg Press A"))
+        .stderr(predicate::str::contains("Leg Press B").not());
+
+    app.cmd()
+        .args([
+            "log",
+            "exercise",
+            &exercise_id.to_string(),
+            "--machine",
+            "Leg Press A",
+            "--machine-note",
+            "pin 90",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("machine notes"))
+        .stdout(predicate::str::contains("seat 4"));
+
+    let notes = app.json(&["machine", "note", "list", &active_machine_id.to_string()]);
+    assert_eq!(notes.as_array().unwrap().len(), 2);
 }
 
 #[test]
@@ -155,4 +275,77 @@ fn daemon_once_smoke_test() {
         .assert()
         .success()
         .stderr(predicate::str::contains("healthy"));
+}
+
+#[test]
+fn tag_allowlist_is_discoverable_and_enforced() {
+    let app = TestApp::new();
+
+    app.cmd()
+        .args(["tag", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("side delt"))
+        .stdout(predicate::str::contains("abs"));
+
+    app.cmd()
+        .args([
+            "exercise",
+            "add",
+            "--name",
+            "Curl",
+            "--kind",
+            "freeweight",
+            "--tag",
+            "arms",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown tag"));
+}
+
+#[test]
+fn exercise_add_requires_force_when_similar_exercise_exists() {
+    let app = TestApp::new();
+
+    app.json(&[
+        "exercise",
+        "add",
+        "--name",
+        "Bench Press",
+        "--kind",
+        "freeweight",
+        "--tag",
+        "chest",
+    ]);
+
+    app.cmd()
+        .args([
+            "exercise",
+            "add",
+            "--name",
+            "bench",
+            "--kind",
+            "freeweight",
+            "--tag",
+            "chest",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("similar exercises"));
+
+    app.cmd()
+        .args([
+            "exercise",
+            "add",
+            "--name",
+            "bench",
+            "--kind",
+            "freeweight",
+            "--tag",
+            "chest",
+            "--force",
+        ])
+        .assert()
+        .success();
 }

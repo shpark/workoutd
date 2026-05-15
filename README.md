@@ -25,22 +25,58 @@ export WORKOUTD_DB=/path/to/workoutd.sqlite3
 ```sh
 workoutd gym add --name "Main Gym"
 workoutd machine add --gym 1 --name "Leg Press" --type leg-press
-workoutd exercise add --name "Bench Press" --kind freeweight --tag push --tag chest
-workoutd exercise add --name "Leg Press" --kind machine --tag legs
+workoutd machine note add 1 --note "seat 4, back 2"
+workoutd tag list
+workoutd exercise add --name "Bench Press" --kind freeweight --tag chest --tag triceps
+workoutd exercise add --name "Leg Press" --kind machine --tag quad --tag glute
 
 workoutd session start --gym 1
-workoutd log exercise 1
+workoutd log exercise "Bench Press"
 workoutd log set --reps 5 --weight 100 --unit kg
+workoutd log exercise "Leg Press" --machine "Leg Press" --machine-note "pin 90"
 workoutd session finish
 ```
 
 Use `--json` anywhere in the command for JSON output:
 
 ```sh
-workoutd --json exercise list --tag push
+workoutd --json exercise list --tag chest
 ```
 
 When `workoutd log exercise EXERCISE_ID` adds an exercise to the active session, it prints the previous completed session entry for the same exercise by default. Use `--history N` to change the number of entries.
+
+`workoutd log exercise` accepts an exercise id, exact name, or exact slug. Fuzzy matches are suggestions only: `bench` will suggest `Bench Press` if that exists, but it will not resolve to it automatically.
+
+`workoutd exercise add` also checks for similar existing exercises. Use `--force` when you intentionally want a distinct exercise with a similar name.
+
+Machine exercises accept `--machine` as a machine id or exact machine name, scoped to the active session gym. If a machine lookup is not exact, suggestions only include machines registered at that gym.
+
+Machine notes are durable notes associated with a machine:
+
+```sh
+workoutd machine note add 1 --note "seat 4, back 2"
+workoutd machine note list 1
+workoutd machine note archive 1
+workoutd machine note restore 1
+```
+
+When logging a machine exercise, `--machine-note` records session-specific machine settings and prior machine notes are printed with the usual exercise history.
+
+Exercise tags are restricted to this allowlist:
+
+```text
+biceps
+triceps
+quad
+glute
+hamstring
+back
+chest
+side delt
+rear delt
+front delt
+abs
+```
 
 ## Service
 

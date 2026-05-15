@@ -6,6 +6,20 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+pub const ALLOWED_TAGS: &[&str] = &[
+    "biceps",
+    "triceps",
+    "quad",
+    "glute",
+    "hamstring",
+    "back",
+    "chest",
+    "side delt",
+    "rear delt",
+    "front delt",
+    "abs",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExerciseKind {
@@ -90,6 +104,16 @@ pub struct Machine {
 }
 
 #[derive(Debug, Serialize)]
+pub struct MachineNote {
+    pub id: i64,
+    pub machine_id: i64,
+    pub session_exercise_id: Option<i64>,
+    pub note: String,
+    pub created_at: String,
+    pub archived_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct Exercise {
     pub id: i64,
     pub name: String,
@@ -146,9 +170,24 @@ pub struct HistoryEntry {
 }
 
 #[derive(Debug, Serialize)]
+pub struct ExerciseSuggestion {
+    pub id: i64,
+    pub name: String,
+    pub kind: ExerciseKind,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MachineSuggestion {
+    pub id: i64,
+    pub name: String,
+    pub machine_type: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct LogExerciseResult {
     pub entry: SessionExercise,
     pub history: Vec<HistoryEntry>,
+    pub machine_notes: Vec<MachineNote>,
 }
 
 pub fn default_db_path() -> Result<PathBuf> {
@@ -198,6 +237,15 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             brand TEXT,
             model TEXT,
             settings_notes TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            archived_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS machine_notes (
+            id INTEGER PRIMARY KEY,
+            machine_id INTEGER NOT NULL REFERENCES machines(id),
+            session_exercise_id INTEGER REFERENCES session_exercises(id) ON DELETE SET NULL,
+            note TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             archived_at TEXT
         );
@@ -259,6 +307,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    seed_allowed_tags(conn)?;
     Ok(())
 }
 
@@ -359,6 +408,61 @@ pub fn restore_machine(conn: &Connection, id: i64) -> Result<()> {
     set_archive(conn, "machines", id, false)
 }
 
+pub fn add_machine_note(
+    conn: &Connection,
+    machine_id: i64,
+    note: &str,
+    session_exercise_id: Option<i64>,
+) -> Result<MachineNote> {
+    let machine = get_machine(conn, machine_id)?;
+    if machine.archived_at.is_some() {
+        bail!("machine {} is archived", machine_id);
+    }
+    require_text(note, "machine note")?;
+    if let Some(session_exercise_id) = session_exercise_id {
+        let entry = get_session_exercise(conn, session_exercise_id)?;
+        if entry.machine_id != Some(machine_id) {
+            bail!(
+                "session exercise {} is not associated with machine {}",
+                session_exercise_id,
+                machine_id
+            );
+        }
+    }
+    conn.execute(
+        "INSERT INTO machine_notes (machine_id, session_exercise_id, note)
+         VALUES (?1, ?2, ?3)",
+        params![machine_id, session_exercise_id, note.trim()],
+    )?;
+    get_machine_note(conn, conn.last_insert_rowid())
+}
+
+pub fn list_machine_notes(
+    conn: &Connection,
+    machine_id: i64,
+    include_archived: bool,
+) -> Result<Vec<MachineNote>> {
+    get_machine(conn, machine_id)?;
+    let sql = if include_archived {
+        "SELECT id, machine_id, session_exercise_id, note, created_at, archived_at
+         FROM machine_notes WHERE machine_id = ?1 ORDER BY created_at DESC, id DESC"
+    } else {
+        "SELECT id, machine_id, session_exercise_id, note, created_at, archived_at
+         FROM machine_notes WHERE machine_id = ?1 AND archived_at IS NULL ORDER BY created_at DESC, id DESC"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([machine_id], map_machine_note)?;
+    collect_rows(rows)
+}
+
+pub fn archive_machine_note(conn: &Connection, id: i64) -> Result<()> {
+    set_archive(conn, "machine_notes", id, true)
+}
+
+pub fn restore_machine_note(conn: &Connection, id: i64) -> Result<()> {
+    set_archive(conn, "machine_notes", id, false)
+}
+
 pub fn add_exercise(
     conn: &mut Connection,
     name: &str,
@@ -423,6 +527,7 @@ pub fn list_exercises(
     kind: Option<ExerciseKind>,
     include_archived: bool,
 ) -> Result<Vec<Exercise>> {
+    let tag = tag.map(normalize_allowed_tag).transpose()?;
     let mut filters = Vec::new();
     if !include_archived {
         filters.push("e.archived_at IS NULL".to_string());
@@ -447,13 +552,156 @@ pub fn list_exercises(
     let mut stmt = conn.prepare(&sql)?;
     let ids: Vec<i64> = match (tag, kind) {
         (Some(tag), Some(kind)) => {
-            collect_rows(stmt.query_map(params![tag, kind.as_str()], |row| row.get(0))?)?
+            collect_rows(stmt.query_map(params![tag.as_str(), kind.as_str()], |row| row.get(0))?)?
         }
-        (Some(tag), None) => collect_rows(stmt.query_map([tag], |row| row.get(0))?)?,
+        (Some(tag), None) => collect_rows(stmt.query_map([tag.as_str()], |row| row.get(0))?)?,
         (None, Some(kind)) => collect_rows(stmt.query_map([kind.as_str()], |row| row.get(0))?)?,
         (None, None) => collect_rows(stmt.query_map([], |row| row.get(0))?)?,
     };
     ids.into_iter().map(|id| get_exercise(conn, id)).collect()
+}
+
+pub fn list_allowed_tags() -> Vec<String> {
+    ALLOWED_TAGS.iter().map(|tag| (*tag).to_string()).collect()
+}
+
+pub fn find_exercise_exact(conn: &Connection, query: &str) -> Result<Option<Exercise>> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        bail!("exercise cannot be empty");
+    }
+    if let Ok(id) = trimmed.parse::<i64>() {
+        return match get_exercise(conn, id) {
+            Ok(exercise) if exercise.archived_at.is_none() => Ok(Some(exercise)),
+            Ok(_) => Ok(None),
+            Err(_) => Ok(None),
+        };
+    }
+    let slug = slugify(trimmed);
+    let id = conn
+        .query_row(
+            "SELECT id FROM exercises
+             WHERE archived_at IS NULL AND (lower(name) = lower(?1) OR slug = ?2)
+             ORDER BY id LIMIT 1",
+            params![trimmed, slug],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    id.map(|id| get_exercise(conn, id)).transpose()
+}
+
+pub fn suggest_exercises(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<ExerciseSuggestion>> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare("SELECT id, name, kind FROM exercises WHERE archived_at IS NULL ORDER BY name")?;
+    let rows = stmt.query_map([], |row| {
+        let kind: String = row.get(2)?;
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            ExerciseKind::from_str(&kind).map_err(to_sql_error)?,
+        ))
+    })?;
+    let mut scored = Vec::new();
+    for row in rows {
+        let (id, name, kind) = row?;
+        if normalize_search(&name) == normalize_search(trimmed) {
+            continue;
+        }
+        if let Some(score) = fuzzy_score(trimmed, &name) {
+            scored.push((score, ExerciseSuggestion { id, name, kind }));
+        }
+    }
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.name.cmp(&right.1.name))
+    });
+    Ok(scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, suggestion)| suggestion)
+        .collect())
+}
+
+pub fn find_machine_exact_for_gym(
+    conn: &Connection,
+    gym_id: i64,
+    query: &str,
+) -> Result<Option<Machine>> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        bail!("machine cannot be empty");
+    }
+    if let Ok(id) = trimmed.parse::<i64>() {
+        return match get_machine(conn, id) {
+            Ok(machine) if machine.archived_at.is_none() && machine.gym_id == gym_id => {
+                Ok(Some(machine))
+            }
+            Ok(_) => Ok(None),
+            Err(_) => Ok(None),
+        };
+    }
+    let id = conn
+        .query_row(
+            "SELECT id FROM machines
+             WHERE gym_id = ?1 AND archived_at IS NULL AND lower(name) = lower(?2)
+             ORDER BY id LIMIT 1",
+            params![gym_id, trimmed],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    id.map(|id| get_machine(conn, id)).transpose()
+}
+
+pub fn suggest_machines_for_gym(
+    conn: &Connection,
+    gym_id: i64,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<MachineSuggestion>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let machines = list_machines(conn, gym_id, false)?;
+    let trimmed = query.trim();
+    let mut scored = Vec::new();
+    for machine in machines {
+        let score = if trimmed.is_empty() {
+            Some(1)
+        } else {
+            fuzzy_score(trimmed, &machine.name)
+        };
+        if let Some(score) = score {
+            scored.push((
+                score,
+                MachineSuggestion {
+                    id: machine.id,
+                    name: machine.name,
+                    machine_type: machine.machine_type,
+                },
+            ));
+        }
+    }
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.name.cmp(&right.1.name))
+    });
+    Ok(scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, suggestion)| suggestion)
+        .collect())
 }
 
 pub fn archive_exercise(conn: &Connection, id: i64) -> Result<()> {
@@ -518,6 +766,7 @@ pub fn log_exercise(
     exercise_id: i64,
     machine_id: Option<i64>,
     notes: Option<&str>,
+    machine_note: Option<&str>,
     history_limit: usize,
 ) -> Result<LogExerciseResult> {
     let session = current_session(conn)?.ok_or_else(|| anyhow!("no active session"))?;
@@ -543,6 +792,7 @@ pub fn log_exercise(
             }
         }
         _ if machine_id.is_some() => bail!("--machine is only valid for machine exercises"),
+        _ if machine_note.is_some() => bail!("--machine-note is only valid for machine exercises"),
         _ => {}
     }
 
@@ -563,9 +813,20 @@ pub fn log_exercise(
         ],
     )?;
     let entry_id = conn.last_insert_rowid();
+    if let (Some(machine_id), Some(machine_note)) = (machine_id, machine_note) {
+        add_machine_note(conn, machine_id, machine_note, Some(entry_id))?;
+    } else if machine_note.is_some() {
+        bail!("--machine-note is only valid for machine exercises");
+    }
     Ok(LogExerciseResult {
         entry: get_session_exercise(conn, entry_id)?,
         history: previous_history(conn, exercise_id, session.id, history_limit)?,
+        machine_notes: machine_id
+            .map(|machine_id| {
+                previous_machine_notes(conn, machine_id, history_limit.max(1), Some(entry_id))
+            })
+            .transpose()?
+            .unwrap_or_default(),
     })
 }
 
@@ -647,6 +908,17 @@ fn get_machine(conn: &Connection, id: i64) -> Result<Machine> {
     )
     .optional()?
     .ok_or_else(|| anyhow!("machine {} not found", id))
+}
+
+fn get_machine_note(conn: &Connection, id: i64) -> Result<MachineNote> {
+    conn.query_row(
+        "SELECT id, machine_id, session_exercise_id, note, created_at, archived_at
+         FROM machine_notes WHERE id = ?1",
+        [id],
+        map_machine_note,
+    )
+    .optional()?
+    .ok_or_else(|| anyhow!("machine note {} not found", id))
 }
 
 fn get_exercise(conn: &Connection, id: i64) -> Result<Exercise> {
@@ -746,6 +1018,31 @@ fn previous_history(
     Ok(entries)
 }
 
+fn previous_machine_notes(
+    conn: &Connection,
+    machine_id: i64,
+    limit: usize,
+    exclude_session_exercise_id: Option<i64>,
+) -> Result<Vec<MachineNote>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id, machine_id, session_exercise_id, note, created_at, archived_at
+         FROM machine_notes
+         WHERE machine_id = ?1
+           AND archived_at IS NULL
+           AND (?2 IS NULL OR session_exercise_id IS NULL OR session_exercise_id != ?2)
+         ORDER BY created_at DESC, id DESC
+         LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(
+        params![machine_id, exclude_session_exercise_id, limit as i64],
+        map_machine_note,
+    )?;
+    collect_rows(rows)
+}
+
 fn sets_for_entry(conn: &Connection, session_exercise_id: i64) -> Result<Vec<SetEntry>> {
     let mut stmt = conn.prepare(
         "SELECT id, session_exercise_id, position, weight_value, weight_unit, reps, created_at
@@ -775,7 +1072,7 @@ fn replace_tags_tx(
         "DELETE FROM exercise_tags WHERE exercise_id = ?1",
         [exercise_id],
     )?;
-    for tag in normalized_tags(tags) {
+    for tag in normalized_tags(tags)? {
         tx.execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", [&tag])?;
         let tag_id: i64 = tx.query_row("SELECT id FROM tags WHERE name = ?1", [&tag], |row| {
             row.get(0)
@@ -788,15 +1085,37 @@ fn replace_tags_tx(
     Ok(())
 }
 
-fn normalized_tags(tags: &[String]) -> Vec<String> {
+fn seed_allowed_tags(conn: &Connection) -> Result<()> {
+    for tag in ALLOWED_TAGS {
+        conn.execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", [tag])?;
+    }
+    Ok(())
+}
+
+fn normalized_tags(tags: &[String]) -> Result<Vec<String>> {
     let mut normalized = tags
         .iter()
-        .map(|tag| tag.trim().to_lowercase())
-        .filter(|tag| !tag.is_empty())
-        .collect::<Vec<_>>();
+        .map(|tag| normalize_allowed_tag(tag))
+        .collect::<Result<Vec<_>>>()?;
     normalized.sort();
     normalized.dedup();
-    normalized
+    Ok(normalized)
+}
+
+fn normalize_allowed_tag(tag: &str) -> Result<String> {
+    let normalized = tag.trim().to_lowercase();
+    if normalized.is_empty() {
+        bail!("tag cannot be empty");
+    }
+    if ALLOWED_TAGS.contains(&normalized.as_str()) {
+        Ok(normalized)
+    } else {
+        bail!(
+            "unknown tag '{}'; allowed tags: {}",
+            tag,
+            ALLOWED_TAGS.join(", ")
+        );
+    }
 }
 
 fn require_active_gym(conn: &Connection, gym_id: i64) -> Result<()> {
@@ -870,6 +1189,55 @@ fn slugify(value: &str) -> String {
     slug.trim_matches('-').to_string()
 }
 
+fn normalize_search(value: &str) -> String {
+    value
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect()
+}
+
+fn fuzzy_score(query: &str, candidate: &str) -> Option<usize> {
+    let query = normalize_search(query);
+    let candidate = normalize_search(candidate);
+    if query.is_empty() || candidate.is_empty() || query == candidate {
+        return None;
+    }
+    if candidate.contains(&query) {
+        return Some(10_000 + query.len());
+    }
+    if query.contains(&candidate) {
+        return Some(9_000 + candidate.len());
+    }
+
+    let distance = levenshtein(&query, &candidate);
+    let max_len = query.len().max(candidate.len());
+    if distance <= 2 || distance * 3 <= max_len {
+        Some(1_000usize.saturating_sub(distance))
+    } else {
+        None
+    }
+}
+
+fn levenshtein(left: &str, right: &str) -> usize {
+    let mut costs = (0..=right.len()).collect::<Vec<_>>();
+    for (left_index, left_char) in left.chars().enumerate() {
+        let mut previous = costs[0];
+        costs[0] = left_index + 1;
+        for (right_index, right_char) in right.chars().enumerate() {
+            let current = costs[right_index + 1];
+            costs[right_index + 1] = if left_char == right_char {
+                previous
+            } else {
+                1 + previous.min(current).min(costs[right_index])
+            };
+            previous = current;
+        }
+    }
+    costs[right.len()]
+}
+
 fn require_text(value: &str, label: &str) -> Result<()> {
     if value.trim().is_empty() {
         bail!("{label} cannot be empty");
@@ -929,6 +1297,17 @@ fn map_machine(row: &Row<'_>) -> rusqlite::Result<Machine> {
         settings_notes: row.get(6)?,
         created_at: row.get(7)?,
         archived_at: row.get(8)?,
+    })
+}
+
+fn map_machine_note(row: &Row<'_>) -> rusqlite::Result<MachineNote> {
+    Ok(MachineNote {
+        id: row.get(0)?,
+        machine_id: row.get(1)?,
+        session_exercise_id: row.get(2)?,
+        note: row.get(3)?,
+        created_at: row.get(4)?,
+        archived_at: row.get(5)?,
     })
 }
 
@@ -1033,12 +1412,12 @@ mod tests {
             add_exercise(&mut mutable, "Leg Press", ExerciseKind::Machine, &[], None).unwrap();
         start_session(&mutable, gym_a.id, None).unwrap();
 
-        let missing = log_exercise(&mutable, exercise.id, None, None, 1)
+        let missing = log_exercise(&mutable, exercise.id, None, None, None, 1)
             .unwrap_err()
             .to_string();
         assert!(missing.contains("require"));
 
-        let wrong_gym = log_exercise(&mutable, exercise.id, Some(other_machine.id), None, 1)
+        let wrong_gym = log_exercise(&mutable, exercise.id, Some(other_machine.id), None, None, 1)
             .unwrap_err()
             .to_string();
         assert!(wrong_gym.contains("does not belong"));
@@ -1052,14 +1431,32 @@ mod tests {
             &mut mutable,
             "Bench Press",
             ExerciseKind::Freeweight,
-            &["push".into(), "chest".into()],
+            &["triceps".into(), "chest".into()],
             None,
         )
         .unwrap();
 
-        let push = list_exercises(&mutable, Some("push"), None, false).unwrap();
-        assert_eq!(push.len(), 1);
-        assert_eq!(push[0].tags, vec!["chest", "push"]);
+        let chest = list_exercises(&mutable, Some("chest"), None, false).unwrap();
+        assert_eq!(chest.len(), 1);
+        assert_eq!(chest[0].tags, vec!["chest", "triceps"]);
+    }
+
+    #[test]
+    fn tags_are_restricted_to_allowlist() {
+        let conn = conn();
+        let mut mutable = conn;
+        let err = add_exercise(
+            &mut mutable,
+            "Bench Press",
+            ExerciseKind::Freeweight,
+            &["push".into()],
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("unknown tag"));
+        assert!(err.contains("biceps"));
     }
 
     #[test]
@@ -1077,12 +1474,12 @@ mod tests {
         .unwrap();
 
         start_session(&mutable, gym.id, None).unwrap();
-        let first = log_exercise(&mutable, exercise.id, None, None, 1).unwrap();
+        let first = log_exercise(&mutable, exercise.id, None, None, None, 1).unwrap();
         log_set(&mutable, first.entry.id, 8, None, None).unwrap();
         finish_session(&mutable, None).unwrap();
 
         start_session(&mutable, gym.id, None).unwrap();
-        let second = log_exercise(&mutable, exercise.id, None, None, 1).unwrap();
+        let second = log_exercise(&mutable, exercise.id, None, None, None, 1).unwrap();
         assert_eq!(second.history.len(), 1);
         assert_eq!(second.history[0].sets[0].reps, 8);
     }
@@ -1095,7 +1492,7 @@ mod tests {
         let exercise =
             add_exercise(&mut mutable, "Squat", ExerciseKind::Freeweight, &[], None).unwrap();
         start_session(&mutable, gym.id, None).unwrap();
-        let entry = log_exercise(&mutable, exercise.id, None, None, 1).unwrap();
+        let entry = log_exercise(&mutable, exercise.id, None, None, None, 1).unwrap();
 
         let err = log_set(&mutable, entry.entry.id, 5, Some(100.0), None)
             .unwrap_err()
@@ -1111,5 +1508,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(set.weight_unit, Some(WeightUnit::Kg));
+    }
+
+    #[test]
+    fn fuzzy_suggestions_do_not_resolve_exercises() {
+        let conn = conn();
+        let mut mutable = conn;
+        add_exercise(
+            &mut mutable,
+            "Bench Press",
+            ExerciseKind::Freeweight,
+            &["chest".into()],
+            None,
+        )
+        .unwrap();
+
+        assert!(find_exercise_exact(&mutable, "bench").unwrap().is_none());
+        let suggestions = suggest_exercises(&mutable, "bench", 5).unwrap();
+        assert_eq!(suggestions[0].name, "Bench Press");
+    }
+
+    #[test]
+    fn machine_notes_are_returned_when_logging_machine_exercise() {
+        let conn = conn();
+        let mut mutable = conn;
+        let gym = add_gym(&mutable, "Main", None, None).unwrap();
+        let machine = add_machine(
+            &mutable,
+            gym.id,
+            "Leg Press A",
+            "leg-press",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        add_machine_note(&mutable, machine.id, "seat 4", None).unwrap();
+        let exercise = add_exercise(
+            &mut mutable,
+            "Leg Press",
+            ExerciseKind::Machine,
+            &["quad".into()],
+            None,
+        )
+        .unwrap();
+        start_session(&mutable, gym.id, None).unwrap();
+
+        let logged = log_exercise(
+            &mutable,
+            exercise.id,
+            Some(machine.id),
+            None,
+            Some("pin 90"),
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(logged.machine_notes.len(), 1);
+        assert_eq!(logged.machine_notes[0].note, "seat 4");
+        let all_notes = list_machine_notes(&mutable, machine.id, false).unwrap();
+        assert_eq!(all_notes.len(), 2);
     }
 }
