@@ -85,6 +85,31 @@ When logging a machine exercise, prior machine notes are printed with the usual 
 
 Session IDs are random UUIDs in CLI and JSON output. `workoutd session cancel` deletes the active unfinished session; `workoutd session list --date YYYY-MM-DD` finds sessions started on a date; `workoutd session export SESSION_UUID` prints a full JSON export with logged exercises, machine details including brand, sets, and session-specific machine notes; `workoutd session delete SESSION_UUID --yes` deletes that session, including its logged exercises and sets.
 
+## AI Agent Migration Guide
+
+Use JSON output when selecting IDs or UUIDs:
+
+```sh
+workoutd --json machine lookup --gym "Main Gym" "leg press"
+```
+
+For machine exercises, do not pass machine names to `log exercise`. Read the `uuid` field from lookup output and pass that value:
+
+```sh
+workoutd log exercise "Leg Press" --machine MACHINE_UUID
+```
+
+Machine notes are now machine-owned records. Do not pass `--machine-note` to `log exercise`; add or inspect notes through the machine note commands:
+
+```sh
+workoutd machine note add MACHINE_UUID --note "seat 4, back 2"
+workoutd --json machine note list MACHINE_UUID
+```
+
+Gym arguments for session and machine commands can be a gym id, exact gym name, or exact gym slug. If a gym lookup is fuzzy, treat the command failure as a suggestion response and retry with an exact value from the message.
+
+Machine lookup results are scoped to the requested gym and include `uuid`, `name`, `machine_type`, `brand`, and `model`. Prefer `uuid` for subsequent commands and use the descriptive fields only to choose the correct machine.
+
 Exercise tags are restricted to this allowlist:
 
 ```text
