@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Row};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -48,7 +49,7 @@ const MACHINE_BRAND_ALIASES: &[(&str, &str)] = &[
     ("Neutech Wellness", "Newtech Wellness"),
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExerciseKind {
     Freeweight,
@@ -79,7 +80,7 @@ impl FromStr for ExerciseKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WeightUnit {
     Kg,
@@ -107,7 +108,7 @@ impl FromStr for WeightUnit {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Gym {
     pub id: i64,
     pub name: String,
@@ -118,7 +119,7 @@ pub struct Gym {
     pub archived_at: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Machine {
     pub id: i64,
     pub uuid: String,
@@ -132,7 +133,7 @@ pub struct Machine {
     pub archived_at: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct MachineNote {
     pub id: i64,
     pub machine_id: i64,
@@ -142,7 +143,7 @@ pub struct MachineNote {
     pub archived_at: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Exercise {
     pub id: i64,
     pub name: String,
@@ -154,7 +155,7 @@ pub struct Exercise {
     pub archived_at: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Session {
     pub id: String,
     pub gym_id: i64,
@@ -164,7 +165,7 @@ pub struct Session {
     pub notes: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SessionExercise {
     pub id: i64,
     pub session_id: String,
@@ -178,7 +179,7 @@ pub struct SessionExercise {
     pub created_at: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SetEntry {
     pub id: i64,
     pub session_exercise_id: i64,
@@ -189,7 +190,7 @@ pub struct SetEntry {
     pub created_at: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct HistoryEntry {
     pub session_id: String,
     pub session_date: String,
@@ -198,13 +199,13 @@ pub struct HistoryEntry {
     pub sets: Vec<SetEntry>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SessionExport {
     pub session: Session,
     pub exercises: Vec<SessionExerciseExport>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SessionExerciseExport {
     pub entry: SessionExercise,
     pub machine: Option<Machine>,
@@ -1006,6 +1007,89 @@ pub fn export_session(conn: &Connection, session_id: &str) -> Result<SessionExpo
     })
 }
 
+pub fn import_session(conn: &mut Connection, exported: &SessionExport) -> Result<SessionExport> {
+    let session_uuid = normalize_session_uuid(&exported.session.id)?;
+    if session_uuid_exists(conn, &session_uuid)? {
+        bail!("session {} already exists", session_uuid);
+    }
+    if exported.session.finished_at.is_none() && current_session(conn)?.is_some() {
+        bail!("cannot import unfinished session while another session is active");
+    }
+
+    let tx = conn.transaction()?;
+    let gym_id = import_gym_tx(&tx, &exported.session)?;
+    tx.execute(
+        "INSERT INTO sessions (uuid, gym_id, started_at, finished_at, notes)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            session_uuid,
+            gym_id,
+            exported.session.started_at,
+            exported.session.finished_at,
+            exported.session.notes
+        ],
+    )?;
+    let session_row_id = tx.last_insert_rowid();
+    let mut imported_machine_notes = HashSet::new();
+
+    for exported_exercise in &exported.exercises {
+        let exercise_id = import_exercise_tx(&tx, &exported_exercise.entry)?;
+        let machine_id = import_machine_tx(&tx, gym_id, exported_exercise)?;
+        tx.execute(
+            "INSERT INTO session_exercises
+                (session_id, exercise_id, machine_id, position, notes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                session_row_id,
+                exercise_id,
+                machine_id,
+                exported_exercise.entry.position,
+                exported_exercise.entry.notes,
+                exported_exercise.entry.created_at
+            ],
+        )?;
+        let imported_entry_id = tx.last_insert_rowid();
+
+        for set in &exported_exercise.sets {
+            if set.reps <= 0 {
+                bail!("imported set reps must be greater than zero");
+            }
+            tx.execute(
+                "INSERT INTO sets
+                    (session_exercise_id, position, weight_value, weight_unit, reps, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    imported_entry_id,
+                    set.position,
+                    set.weight_value,
+                    set.weight_unit.map(WeightUnit::as_str),
+                    set.reps,
+                    set.created_at
+                ],
+            )?;
+        }
+
+        if let Some(machine_id) = machine_id {
+            for note in &exported_exercise.machine_notes {
+                let key = (machine_id, note.note.trim().to_string());
+                if imported_machine_notes.insert(key.clone())
+                    && !machine_note_text_exists_tx(&tx, machine_id, &key.1)?
+                {
+                    tx.execute(
+                        "INSERT INTO machine_notes
+                            (machine_id, note, created_at, archived_at)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![machine_id, key.1, note.created_at, note.archived_at],
+                    )?;
+                }
+            }
+        }
+    }
+
+    tx.commit()?;
+    export_session(conn, &exported.session.id)
+}
+
 pub fn log_exercise(
     conn: &Connection,
     exercise_id: i64,
@@ -1135,6 +1219,130 @@ fn get_gym(conn: &Connection, id: i64) -> Result<Gym> {
     )
     .optional()?
     .ok_or_else(|| anyhow!("gym {} not found", id))
+}
+
+fn session_uuid_exists(conn: &Connection, uuid: &str) -> Result<bool> {
+    let exists: Option<i64> = conn
+        .query_row("SELECT id FROM sessions WHERE uuid = ?1", [uuid], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    Ok(exists.is_some())
+}
+
+fn import_gym_tx(tx: &rusqlite::Transaction<'_>, session: &Session) -> Result<i64> {
+    if let Some(id) = tx
+        .query_row(
+            "SELECT id FROM gyms WHERE lower(name) = lower(?1) AND archived_at IS NULL ORDER BY id LIMIT 1",
+            [session.gym_name.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    {
+        return Ok(id);
+    }
+
+    require_text(&session.gym_name, "gym name")?;
+    let slug = unique_slug(tx, "gyms", &session.gym_name)?;
+    tx.execute(
+        "INSERT INTO gyms (name, slug) VALUES (?1, ?2)",
+        params![session.gym_name.trim(), slug],
+    )?;
+    Ok(tx.last_insert_rowid())
+}
+
+fn import_exercise_tx(tx: &rusqlite::Transaction<'_>, entry: &SessionExercise) -> Result<i64> {
+    if let Some(id) = tx
+        .query_row(
+            "SELECT id FROM exercises
+             WHERE archived_at IS NULL AND lower(name) = lower(?1)
+             ORDER BY id LIMIT 1",
+            [entry.exercise_name.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    {
+        return Ok(id);
+    }
+
+    require_text(&entry.exercise_name, "exercise name")?;
+    let slug = unique_slug(tx, "exercises", &entry.exercise_name)?;
+    tx.execute(
+        "INSERT INTO exercises (name, slug, kind) VALUES (?1, ?2, ?3)",
+        params![entry.exercise_name.trim(), slug, entry.kind.as_str()],
+    )?;
+    Ok(tx.last_insert_rowid())
+}
+
+fn import_machine_tx(
+    tx: &rusqlite::Transaction<'_>,
+    gym_id: i64,
+    exported: &SessionExerciseExport,
+) -> Result<Option<i64>> {
+    if exported.entry.kind != ExerciseKind::Machine {
+        return Ok(None);
+    }
+
+    let machine = exported.machine.as_ref().ok_or_else(|| {
+        anyhow!(
+            "machine exercise '{}' has no exported machine",
+            exported.entry.exercise_name
+        )
+    })?;
+    let machine_uuid = normalize_machine_uuid(&machine.uuid)?;
+    if let Some((id, existing_gym_id)) = tx
+        .query_row(
+            "SELECT id, gym_id FROM machines WHERE uuid = ?1",
+            [machine_uuid.as_str()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?
+    {
+        if existing_gym_id != gym_id {
+            bail!(
+                "machine {} already exists under a different gym",
+                machine_uuid
+            );
+        }
+        return Ok(Some(id));
+    }
+
+    require_text(&machine.name, "machine name")?;
+    require_text(&machine.machine_type, "machine type")?;
+    tx.execute(
+        "INSERT INTO machines
+            (uuid, gym_id, name, machine_type, brand, model, settings_notes, created_at, archived_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            machine_uuid,
+            gym_id,
+            machine.name.trim(),
+            machine.machine_type.trim(),
+            normalize_machine_brand(machine.brand.as_deref())?,
+            machine.model,
+            machine.settings_notes,
+            machine.created_at,
+            machine.archived_at
+        ],
+    )?;
+    Ok(Some(tx.last_insert_rowid()))
+}
+
+fn machine_note_text_exists_tx(
+    tx: &rusqlite::Transaction<'_>,
+    machine_id: i64,
+    note: &str,
+) -> Result<bool> {
+    let exists: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM machine_notes
+             WHERE machine_id = ?1 AND note = ?2 AND archived_at IS NULL
+             LIMIT 1",
+            params![machine_id, note],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(exists.is_some())
 }
 
 fn get_machine(conn: &Connection, id: i64) -> Result<Machine> {

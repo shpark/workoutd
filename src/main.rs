@@ -1,18 +1,20 @@
 use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
+use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
 use workoutd::{
     add_exercise, add_gym, add_machine, add_machine_note, archive_exercise, archive_gym,
     archive_machine, archive_machine_note, cancel_session, current_session, default_db_path,
     delete_session, export_session, find_exercise_exact, find_gym_exact, find_machine_by_uuid,
-    find_machine_uuid_for_gym, finish_session, latest_session_exercise_id, list_allowed_tags,
-    list_exercises, list_gyms, list_machine_notes, list_machines, list_preset_machine_brands,
-    list_sessions, log_exercise, log_set, open_database, restore_exercise, restore_gym,
-    restore_machine, restore_machine_note, start_session, suggest_exercises, suggest_gyms,
-    suggest_machines_for_gym, update_exercise, ExerciseKind, ExerciseSuggestion, GymSuggestion,
-    HistoryEntry, LogExerciseResult, MachineNote, MachineSuggestion, Session, SetEntry, WeightUnit,
+    find_machine_uuid_for_gym, finish_session, import_session, latest_session_exercise_id,
+    list_allowed_tags, list_exercises, list_gyms, list_machine_notes, list_machines,
+    list_preset_machine_brands, list_sessions, log_exercise, log_set, open_database,
+    restore_exercise, restore_gym, restore_machine, restore_machine_note, start_session,
+    suggest_exercises, suggest_gyms, suggest_machines_for_gym, update_exercise, ExerciseKind,
+    ExerciseSuggestion, GymSuggestion, HistoryEntry, LogExerciseResult, MachineNote,
+    MachineSuggestion, Session, SessionExport, SetEntry, WeightUnit,
 };
 
 #[derive(Parser)]
@@ -242,6 +244,8 @@ enum SessionCommand {
     Current,
     #[command(about = "Export a full session as JSON")]
     Export(SessionExportArgs),
+    #[command(about = "Import a session JSON export")]
+    Import(SessionImportArgs),
     #[command(about = "Finish the active session")]
     Finish(SessionFinish),
     #[command(about = "Delete the active unfinished session")]
@@ -269,6 +273,12 @@ struct SessionList {
 struct SessionExportArgs {
     /// Session UUID from `workoutd session list` or session JSON output.
     session_id: String,
+}
+
+#[derive(Args)]
+struct SessionImportArgs {
+    /// Path to JSON created by `workoutd session export`.
+    path: PathBuf,
 }
 
 #[derive(Args)]
@@ -591,6 +601,18 @@ fn main() -> Result<()> {
             SessionCommand::Export(args) => {
                 let exported = export_session(&conn, &args.session_id)?;
                 emit(true, &exported, || Ok(()))
+            }
+            SessionCommand::Import(args) => {
+                let input = fs::read_to_string(&args.path)?;
+                let exported: SessionExport = serde_json::from_str(&input)?;
+                let imported = import_session(&mut conn, &exported)?;
+                emit(cli.json, &imported, || {
+                    println!(
+                        "imported session {} at {} started {}",
+                        imported.session.id, imported.session.gym_name, imported.session.started_at
+                    );
+                    Ok(())
+                })
             }
             SessionCommand::Finish(args) => {
                 let session = finish_session(&conn, args.notes.as_deref())?;

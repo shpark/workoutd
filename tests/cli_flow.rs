@@ -1,6 +1,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::Value;
+use std::fs;
 use tempfile::TempDir;
 
 struct TestApp {
@@ -248,6 +249,104 @@ fn session_export_outputs_full_session_json() {
         exported["exercises"][0]["machine_notes"][0]["note"],
         "pin 90"
     );
+}
+
+#[test]
+fn session_import_restores_exported_session_json() {
+    let source = TestApp::new();
+    let gym = source.json(&["gym", "add", "--name", "Main Gym"]);
+    let gym_id = gym["id"].as_i64().unwrap();
+    let machine = source.json(&[
+        "machine",
+        "add",
+        "--gym",
+        &gym_id.to_string(),
+        "--name",
+        "Leg Press",
+        "--type",
+        "leg-press",
+        "--brand",
+        "Hammer Strength",
+    ]);
+    let machine_uuid = machine["uuid"].as_str().unwrap().to_string();
+    source
+        .cmd()
+        .args(["machine", "note", "add", &machine_uuid, "--note", "pin 90"])
+        .assert()
+        .success();
+    let exercise = source.json(&[
+        "exercise",
+        "add",
+        "--name",
+        "Leg Press",
+        "--kind",
+        "machine",
+        "--tag",
+        "quad",
+    ]);
+    let exercise_id = exercise["id"].as_i64().unwrap();
+    let session = source.json(&["session", "start", "--gym", &gym_id.to_string()]);
+    let session_id = session["id"].as_str().unwrap().to_string();
+    let entry = source.json(&[
+        "log",
+        "exercise",
+        &exercise_id.to_string(),
+        "--machine",
+        &machine_uuid,
+    ]);
+    let entry_id = entry["entry"]["id"].as_i64().unwrap();
+    source
+        .cmd()
+        .args([
+            "log",
+            "set",
+            "--exercise-entry",
+            &entry_id.to_string(),
+            "--reps",
+            "10",
+            "--weight",
+            "180",
+            "--unit",
+            "kg",
+        ])
+        .assert()
+        .success();
+    source.cmd().args(["session", "finish"]).assert().success();
+
+    let exported = source.json(&["session", "export", &session_id]);
+    let export_dir = tempfile::tempdir().unwrap();
+    let export_path = export_dir.path().join("session.json");
+    fs::write(
+        &export_path,
+        serde_json::to_string_pretty(&exported).unwrap(),
+    )
+    .unwrap();
+
+    let target = TestApp::new();
+    let imported = target.json(&["session", "import", export_path.to_str().unwrap()]);
+
+    assert_eq!(imported["session"]["id"], session_id);
+    assert_eq!(
+        imported["exercises"][0]["entry"]["exercise_name"],
+        "Leg Press"
+    );
+    assert_eq!(imported["exercises"][0]["machine"]["uuid"], machine_uuid);
+    assert_eq!(
+        imported["exercises"][0]["machine"]["brand"],
+        "Hammer Strength"
+    );
+    assert_eq!(imported["exercises"][0]["sets"][0]["reps"], 10);
+    assert_eq!(
+        imported["exercises"][0]["machine_notes"][0]["note"],
+        "pin 90"
+    );
+
+    target
+        .cmd()
+        .args(["session", "import", export_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already exists"));
 }
 
 #[test]

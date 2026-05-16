@@ -39,6 +39,7 @@ workoutd log exercise "Leg Press" --machine MACHINE_UUID
 workoutd session finish
 workoutd session list --date 2026-05-15
 workoutd session export 550e8400-e29b-41d4-a716-446655440000
+workoutd session import session.json
 workoutd session delete 550e8400-e29b-41d4-a716-446655440000 --yes
 ```
 
@@ -83,7 +84,7 @@ workoutd machine note restore 1
 
 When logging a machine exercise, prior machine notes are printed with the usual exercise history.
 
-Session IDs are random UUIDs in CLI and JSON output. `workoutd session cancel` deletes the active unfinished session; `workoutd session list --date YYYY-MM-DD` finds sessions started on a date; `workoutd session export SESSION_UUID` prints a full JSON export with logged exercises, machine details including brand, sets, and session-specific machine notes; `workoutd session delete SESSION_UUID --yes` deletes that session, including its logged exercises and sets.
+Session IDs are random UUIDs in CLI and JSON output. `workoutd session cancel` deletes the active unfinished session; `workoutd session list --date YYYY-MM-DD` finds sessions started on a date; `workoutd session export SESSION_UUID` prints a full JSON export with logged exercises, machine details including brand, sets, and machine notes; `workoutd session import PATH` restores a session JSON export and creates missing gym, exercise, and machine records as needed; `workoutd session delete SESSION_UUID --yes` deletes that session, including its logged exercises and sets.
 
 ## AI Agent Migration Guide
 
@@ -109,6 +110,15 @@ workoutd --json machine note list MACHINE_UUID
 Gym arguments for session and machine commands can be a gym id, exact gym name, or exact gym slug. If a gym lookup is fuzzy, treat the command failure as a suggestion response and retry with an exact value from the message.
 
 Machine lookup results are scoped to the requested gym and include `uuid`, `name`, `machine_type`, `brand`, and `model`. Prefer `uuid` for subsequent commands and use the descriptive fields only to choose the correct machine.
+
+To move a session between databases, export it to a file and import that file into the target database:
+
+```sh
+workoutd session export SESSION_UUID > session.json
+WORKOUTD_DB=/path/to/target.sqlite3 workoutd session import session.json
+```
+
+The import preserves the session UUID and timestamps, reuses matching catalog records, and creates missing gym, exercise, and machine records from the export. Import fails if the session UUID already exists.
 
 Exercise tags are restricted to this allowlist:
 
