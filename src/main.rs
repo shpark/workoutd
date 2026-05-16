@@ -6,12 +6,12 @@ use std::str::FromStr;
 use workoutd::{
     add_exercise, add_gym, add_machine, add_machine_note, archive_exercise, archive_gym,
     archive_machine, archive_machine_note, cancel_session, current_session, default_db_path,
-    delete_session, find_exercise_exact, find_machine_exact_for_gym, finish_session,
-    latest_session_exercise_id, list_allowed_tags, list_exercises, list_gyms, list_machine_notes,
-    list_machines, list_sessions, log_exercise, log_set, open_database, restore_exercise,
-    restore_gym, restore_machine, restore_machine_note, start_session, suggest_exercises,
-    suggest_machines_for_gym, update_exercise, ExerciseKind, ExerciseSuggestion, HistoryEntry,
-    LogExerciseResult, MachineNote, MachineSuggestion, Session, SetEntry, WeightUnit,
+    delete_session, export_session, find_exercise_exact, find_machine_exact_for_gym,
+    finish_session, latest_session_exercise_id, list_allowed_tags, list_exercises, list_gyms,
+    list_machine_notes, list_machines, list_sessions, log_exercise, log_set, open_database,
+    restore_exercise, restore_gym, restore_machine, restore_machine_note, start_session,
+    suggest_exercises, suggest_machines_for_gym, update_exercise, ExerciseKind, ExerciseSuggestion,
+    HistoryEntry, LogExerciseResult, MachineNote, MachineSuggestion, Session, SetEntry, WeightUnit,
 };
 
 #[derive(Parser)]
@@ -217,6 +217,8 @@ enum SessionCommand {
     List(SessionList),
     #[command(about = "Show the active session")]
     Current,
+    #[command(about = "Export a full session as JSON")]
+    Export(SessionExportArgs),
     #[command(about = "Finish the active session")]
     Finish(SessionFinish),
     #[command(about = "Delete the active unfinished session")]
@@ -238,6 +240,12 @@ struct SessionList {
     /// Filter sessions by started date in YYYY-MM-DD format.
     #[arg(long)]
     date: Option<String>,
+}
+
+#[derive(Args)]
+struct SessionExportArgs {
+    /// Session UUID from `workoutd session list` or session JSON output.
+    session_id: String,
 }
 
 #[derive(Args)]
@@ -539,6 +547,10 @@ fn main() -> Result<()> {
                     }
                     Ok(())
                 })
+            }
+            SessionCommand::Export(args) => {
+                let exported = export_session(&conn, &args.session_id)?;
+                emit(true, &exported, || Ok(()))
             }
             SessionCommand::Finish(args) => {
                 let session = finish_session(&conn, args.notes.as_deref())?;

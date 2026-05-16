@@ -36,6 +36,7 @@ workoutd log set --reps 5 --weight 100 --unit kg
 workoutd log exercise "Leg Press" --machine "Leg Press" --machine-note "pin 90"
 workoutd session finish
 workoutd session list --date 2026-05-15
+workoutd session export 550e8400-e29b-41d4-a716-446655440000
 workoutd session delete 550e8400-e29b-41d4-a716-446655440000 --yes
 ```
 
@@ -64,7 +65,7 @@ workoutd machine note restore 1
 
 When logging a machine exercise, `--machine-note` records session-specific machine settings and prior machine notes are printed with the usual exercise history.
 
-Session IDs are random UUIDs in CLI and JSON output. `workoutd session cancel` deletes the active unfinished session; `workoutd session list --date YYYY-MM-DD` finds sessions started on a date; `workoutd session delete SESSION_UUID --yes` deletes that session, including its logged exercises and sets.
+Session IDs are random UUIDs in CLI and JSON output. `workoutd session cancel` deletes the active unfinished session; `workoutd session list --date YYYY-MM-DD` finds sessions started on a date; `workoutd session export SESSION_UUID` prints a full JSON export with logged exercises, sets, and session-specific machine notes; `workoutd session delete SESSION_UUID --yes` deletes that session, including its logged exercises and sets.
 
 Exercise tags are restricted to this allowlist:
 

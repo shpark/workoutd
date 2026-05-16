@@ -170,6 +170,19 @@ pub struct HistoryEntry {
     pub sets: Vec<SetEntry>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct SessionExport {
+    pub session: Session,
+    pub exercises: Vec<SessionExerciseExport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionExerciseExport {
+    pub entry: SessionExercise,
+    pub sets: Vec<SetEntry>,
+    pub machine_notes: Vec<MachineNote>,
+}
+
 struct SessionRecord {
     row_id: i64,
     session: Session,
@@ -814,6 +827,27 @@ pub fn list_sessions(conn: &Connection, date: Option<&str>) -> Result<Vec<Sessio
     Ok(records.into_iter().map(|record| record.session).collect())
 }
 
+pub fn export_session(conn: &Connection, session_id: &str) -> Result<SessionExport> {
+    let record = get_session_record_by_uuid(conn, session_id)?;
+    let mut stmt =
+        conn.prepare("SELECT id FROM session_exercises WHERE session_id = ?1 ORDER BY position")?;
+    let entry_ids = collect_rows(stmt.query_map([record.row_id], |row| row.get::<_, i64>(0))?)?;
+
+    let mut exercises = Vec::new();
+    for entry_id in entry_ids {
+        exercises.push(SessionExerciseExport {
+            entry: get_session_exercise(conn, entry_id)?,
+            sets: sets_for_entry(conn, entry_id)?,
+            machine_notes: machine_notes_for_session_exercise(conn, entry_id)?,
+        });
+    }
+
+    Ok(SessionExport {
+        session: record.session,
+        exercises,
+    })
+}
+
 pub fn log_exercise(
     conn: &Connection,
     exercise_id: i64,
@@ -1132,6 +1166,20 @@ fn sets_for_entry(conn: &Connection, session_exercise_id: i64) -> Result<Vec<Set
          FROM sets WHERE session_exercise_id = ?1 ORDER BY position",
     )?;
     let rows = stmt.query_map([session_exercise_id], map_set)?;
+    collect_rows(rows)
+}
+
+fn machine_notes_for_session_exercise(
+    conn: &Connection,
+    session_exercise_id: i64,
+) -> Result<Vec<MachineNote>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, machine_id, session_exercise_id, note, created_at, archived_at
+         FROM machine_notes
+         WHERE session_exercise_id = ?1
+         ORDER BY created_at, id",
+    )?;
+    let rows = stmt.query_map([session_exercise_id], map_machine_note)?;
     collect_rows(rows)
 }
 

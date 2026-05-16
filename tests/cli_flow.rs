@@ -163,6 +163,86 @@ fn session_delete_requires_confirmation_and_removes_finished_session() {
 }
 
 #[test]
+fn session_export_outputs_full_session_json() {
+    let app = TestApp::new();
+
+    let gym = app.json(&["gym", "add", "--name", "Main Gym"]);
+    let gym_id = gym["id"].as_i64().unwrap();
+    let machine = app.json(&[
+        "machine",
+        "add",
+        "--gym",
+        &gym_id.to_string(),
+        "--name",
+        "Leg Press",
+        "--type",
+        "leg-press",
+    ]);
+    let machine_id = machine["id"].as_i64().unwrap();
+    let exercise = app.json(&[
+        "exercise",
+        "add",
+        "--name",
+        "Leg Press",
+        "--kind",
+        "machine",
+        "--tag",
+        "quad",
+    ]);
+    let exercise_id = exercise["id"].as_i64().unwrap();
+    let session = app.json(&["session", "start", "--gym", &gym_id.to_string()]);
+    let session_id = session["id"].as_str().unwrap().to_string();
+    let entry = app.json(&[
+        "log",
+        "exercise",
+        &exercise_id.to_string(),
+        "--machine",
+        &machine_id.to_string(),
+        "--machine-note",
+        "pin 90",
+    ]);
+    let entry_id = entry["entry"]["id"].as_i64().unwrap();
+    app.cmd()
+        .args([
+            "log",
+            "set",
+            "--exercise-entry",
+            &entry_id.to_string(),
+            "--reps",
+            "10",
+            "--weight",
+            "180",
+            "--unit",
+            "kg",
+        ])
+        .assert()
+        .success();
+    app.cmd().args(["session", "finish"]).assert().success();
+
+    let output = app
+        .cmd()
+        .args(["session", "export", &session_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let exported: Value = serde_json::from_slice(&output).unwrap();
+
+    assert_eq!(exported["session"]["id"], session_id);
+    assert_eq!(exported["exercises"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        exported["exercises"][0]["entry"]["exercise_name"],
+        "Leg Press"
+    );
+    assert_eq!(exported["exercises"][0]["sets"][0]["reps"], 10);
+    assert_eq!(
+        exported["exercises"][0]["machine_notes"][0]["note"],
+        "pin 90"
+    );
+}
+
+#[test]
 fn log_exercise_suggests_similar_names_without_resolving() {
     let app = TestApp::new();
 
