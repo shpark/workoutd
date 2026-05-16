@@ -13,8 +13,8 @@ use workoutd::{
     list_preset_machine_brands, list_sessions, log_exercise, log_set, open_database,
     restore_exercise, restore_gym, restore_machine, restore_machine_note, start_session,
     suggest_exercises, suggest_gyms, suggest_machines_for_gym, update_exercise, ExerciseKind,
-    ExerciseSuggestion, GymSuggestion, HistoryEntry, LogExerciseResult, MachineNote,
-    MachineSuggestion, Session, SessionExport, SetEntry, WeightUnit,
+    ExerciseSuggestion, GymSuggestion, HistoryEntry, LogExerciseResult, MachineLoadKind,
+    MachineNote, MachineSuggestion, Session, SessionExport, SetEntry, WeightUnit,
 };
 
 #[derive(Parser)]
@@ -121,6 +121,8 @@ struct MachineAdd {
     brand: Option<String>,
     #[arg(long)]
     model: Option<String>,
+    #[arg(long = "load-kind")]
+    load_kind: Option<String>,
     #[arg(long = "settings-notes")]
     settings_notes: Option<String>,
 }
@@ -390,6 +392,11 @@ fn main() -> Result<()> {
         Command::Machine { command } => match command {
             MachineCommand::Add(args) => {
                 let gym = resolve_active_gym_or_suggest(&conn, &args.gym)?;
+                let load_kind = args
+                    .load_kind
+                    .as_deref()
+                    .map(MachineLoadKind::from_str)
+                    .transpose()?;
                 let machine = add_machine(
                     &conn,
                     gym.id,
@@ -397,6 +404,7 @@ fn main() -> Result<()> {
                     &args.machine_type,
                     args.brand.as_deref(),
                     args.model.as_deref(),
+                    load_kind,
                     args.settings_notes.as_deref(),
                 )?;
                 emit(cli.json, &machine, || {
@@ -409,11 +417,16 @@ fn main() -> Result<()> {
                 let machines = list_machines(&conn, gym.id, args.include_archived)?;
                 emit(cli.json, &machines, || {
                     for machine in &machines {
+                        let load_kind = machine
+                            .load_kind
+                            .map(|load_kind| format!(" {}", load_kind.as_str()))
+                            .unwrap_or_default();
                         println!(
-                            "{}: {} [{}]{}",
+                            "{}: {} [{}{}]{}",
                             machine.uuid,
                             machine.name,
                             machine.machine_type,
+                            load_kind,
                             archived_suffix(&machine.archived_at)
                         );
                     }
@@ -840,9 +853,13 @@ fn format_machine_suggestions(suggestions: &[MachineSuggestion]) -> String {
                 .as_ref()
                 .map(|model| format!(" model={model}"))
                 .unwrap_or_default();
+            let load_kind = machine
+                .load_kind
+                .map(|load_kind| format!(" load_kind={}", load_kind.as_str()))
+                .unwrap_or_default();
             format!(
-                "- {}: {} [{}]{}{}",
-                machine.uuid, machine.name, machine.machine_type, brand, model
+                "- {}: {} [{}]{}{}{}",
+                machine.uuid, machine.name, machine.machine_type, brand, model, load_kind
             )
         })
         .collect::<Vec<_>>()

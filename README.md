@@ -25,7 +25,7 @@ export WORKOUTD_DB=/path/to/workoutd.sqlite3
 ```sh
 workoutd gym add --name "Main Gym"
 workoutd machine brand list
-workoutd machine add --gym "Main Gym" --name "Leg Press" --type leg-press --brand "Hammer Strength"
+workoutd machine add --gym "Main Gym" --name "Leg Press" --type leg-press --brand "Hammer Strength" --load-kind plate-loaded
 workoutd --json machine lookup --gym "Main Gym" "Leg Press"
 workoutd machine note add MACHINE_UUID --note "seat 4, back 2"
 workoutd tag list
@@ -40,6 +40,7 @@ workoutd session finish
 workoutd session list --date 2026-05-15
 workoutd session export 550e8400-e29b-41d4-a716-446655440000
 workoutd session import session.json
+workoutd-html --input session.json --timezone Asia/Seoul --output session.html
 workoutd session delete 550e8400-e29b-41d4-a716-446655440000 --yes
 ```
 
@@ -57,13 +58,13 @@ When `workoutd log exercise EXERCISE_ID` adds an exercise to the active session,
 
 `workoutd exercise add` also checks for similar existing exercises. Use `--force` when you intentionally want a distinct exercise with a similar name.
 
-Machine exercises accept `--machine MACHINE_UUID`, scoped to the active session gym. Use lookup to find the UUID by name, type, or brand:
+Machine exercises accept `--machine MACHINE_UUID`, scoped to the active session gym. Use lookup to find the UUID by name, type, brand, or load kind:
 
 ```sh
 workoutd --json machine lookup --gym "Main Gym" "leg press"
 ```
 
-The lookup output includes `uuid`, `name`, `machine_type`, `brand`, and `model`, which makes it suitable for an AI agent to select a machine and pass the UUID to `workoutd log exercise`.
+The lookup output includes `uuid`, `name`, `machine_type`, `brand`, `model`, and `load_kind`, which makes it suitable for an AI agent to select a machine and pass the UUID to `workoutd log exercise`.
 
 Machine brands have discoverable presets:
 
@@ -71,7 +72,7 @@ Machine brands have discoverable presets:
 workoutd machine brand list
 ```
 
-When adding a machine, preset brand names are matched case-insensitively and stored with canonical capitalization. Custom brand names are also accepted.
+When adding a machine, preset brand names are matched case-insensitively and stored with canonical capitalization. Custom brand names are also accepted. Use `--load-kind plate-loaded` or `--load-kind pin-loaded` when that distinction matters.
 
 Machine notes are durable notes associated with a machine:
 
@@ -109,7 +110,7 @@ workoutd --json machine note list MACHINE_UUID
 
 Gym arguments for session and machine commands can be a gym id, exact gym name, or exact gym slug. If a gym lookup is fuzzy, treat the command failure as a suggestion response and retry with an exact value from the message.
 
-Machine lookup results are scoped to the requested gym and include `uuid`, `name`, `machine_type`, `brand`, and `model`. Prefer `uuid` for subsequent commands and use the descriptive fields only to choose the correct machine.
+Machine lookup results are scoped to the requested gym and include `uuid`, `name`, `machine_type`, `brand`, `model`, and `load_kind`. Prefer `uuid` for subsequent commands and use the descriptive fields only to choose the correct machine.
 
 To move a session between databases, export it to a file and import that file into the target database:
 
@@ -119,6 +120,17 @@ WORKOUTD_DB=/path/to/target.sqlite3 workoutd session import session.json
 ```
 
 The import preserves the session UUID and timestamps, reuses matching catalog records, and creates missing gym, exercise, and machine records from the export. Import fails if the session UUID already exists.
+
+To render a standalone HTML report, use the `workoutd-html` binary with either an exported JSON file or a session UUID from the database:
+
+```sh
+workoutd-html --input session.json --timezone Asia/Seoul --output session.html
+workoutd-html SESSION_UUID --timezone Asia/Seoul --output session.html
+workoutd-html --exercise-history "Bench Press" --timezone Asia/Seoul --output bench-history.html
+```
+
+Exercise history reports chart total volume and max weight when completed sessions use one weight unit. If the history has no weighted sets or mixes units, the report falls back to total reps.
+By default, exercise history charts use the latest 12 completed entries. Pass `--history-limit N` to change the number of entries.
 
 Exercise tags are restricted to this allowlist:
 

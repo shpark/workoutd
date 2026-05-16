@@ -108,6 +108,34 @@ impl FromStr for WeightUnit {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MachineLoadKind {
+    PlateLoaded,
+    PinLoaded,
+}
+
+impl MachineLoadKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PlateLoaded => "plate-loaded",
+            Self::PinLoaded => "pin-loaded",
+        }
+    }
+}
+
+impl FromStr for MachineLoadKind {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "plate-loaded" => Ok(Self::PlateLoaded),
+            "pin-loaded" => Ok(Self::PinLoaded),
+            _ => bail!("machine load kind must be one of: plate-loaded, pin-loaded"),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Gym {
     pub id: i64,
@@ -128,6 +156,7 @@ pub struct Machine {
     pub machine_type: String,
     pub brand: Option<String>,
     pub model: Option<String>,
+    pub load_kind: Option<MachineLoadKind>,
     pub settings_notes: Option<String>,
     pub created_at: String,
     pub archived_at: Option<String>,
@@ -232,6 +261,7 @@ pub struct MachineSuggestion {
     pub machine_type: String,
     pub brand: Option<String>,
     pub model: Option<String>,
+    pub load_kind: Option<MachineLoadKind>,
 }
 
 #[derive(Debug, Serialize)]
@@ -283,7 +313,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             slug TEXT NOT NULL UNIQUE,
             address TEXT,
             notes TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
             archived_at TEXT
         );
 
@@ -295,8 +325,9 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             machine_type TEXT NOT NULL,
             brand TEXT,
             model TEXT,
+            load_kind TEXT CHECK (load_kind IN ('plate-loaded', 'pin-loaded')),
             settings_notes TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
             archived_at TEXT
         );
 
@@ -305,7 +336,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             machine_id INTEGER NOT NULL REFERENCES machines(id),
             session_exercise_id INTEGER REFERENCES session_exercises(id) ON DELETE SET NULL,
             note TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
             archived_at TEXT
         );
 
@@ -315,7 +346,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             slug TEXT NOT NULL UNIQUE,
             kind TEXT NOT NULL CHECK (kind IN ('freeweight', 'machine', 'calisthenics')),
             description TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
             archived_at TEXT
         );
 
@@ -334,7 +365,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             id INTEGER PRIMARY KEY,
             uuid TEXT NOT NULL UNIQUE,
             gym_id INTEGER NOT NULL REFERENCES gyms(id),
-            started_at TEXT NOT NULL DEFAULT (datetime('now')),
+            started_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
             finished_at TEXT,
             notes TEXT
         );
@@ -350,7 +381,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             machine_id INTEGER REFERENCES machines(id),
             position INTEGER NOT NULL,
             notes TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
             UNIQUE(session_id, position)
         );
 
@@ -361,7 +392,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             weight_value REAL,
             weight_unit TEXT CHECK (weight_unit IN ('kg', 'lb')),
             reps INTEGER NOT NULL CHECK (reps > 0),
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
             UNIQUE(session_exercise_id, position),
             CHECK ((weight_value IS NULL AND weight_unit IS NULL) OR (weight_value IS NOT NULL AND weight_unit IS NOT NULL))
         );
@@ -369,6 +400,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     )?;
     ensure_session_uuid_column(conn)?;
     ensure_machine_uuid_column(conn)?;
+    ensure_machine_load_kind_column(conn)?;
     seed_allowed_tags(conn)?;
     Ok(())
 }
@@ -424,6 +456,15 @@ fn ensure_machine_uuid_column(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_machine_load_kind_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(machines)")?;
+    let columns = collect_rows(stmt.query_map([], |row| row.get::<_, String>(1))?)?;
+    if !columns.iter().any(|column| column == "load_kind") {
+        conn.execute("ALTER TABLE machines ADD COLUMN load_kind TEXT", [])?;
+    }
+    Ok(())
+}
+
 pub fn add_gym(
     conn: &Connection,
     name: &str,
@@ -433,7 +474,8 @@ pub fn add_gym(
     require_text(name, "gym name")?;
     let slug = unique_slug(conn, "gyms", name)?;
     conn.execute(
-        "INSERT INTO gyms (name, slug, address, notes) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO gyms (name, slug, address, notes, created_at)
+         VALUES (?1, ?2, ?3, ?4, datetime('now','localtime'))",
         params![
             name.trim(),
             slug,
@@ -548,6 +590,7 @@ pub fn add_machine(
     machine_type: &str,
     brand: Option<&str>,
     model: Option<&str>,
+    load_kind: Option<MachineLoadKind>,
     settings_notes: Option<&str>,
 ) -> Result<Machine> {
     require_active_gym(conn, gym_id)?;
@@ -555,8 +598,8 @@ pub fn add_machine(
     require_text(machine_type, "machine type")?;
     let uuid = Uuid::new_v4().to_string();
     conn.execute(
-        "INSERT INTO machines (uuid, gym_id, name, machine_type, brand, model, settings_notes)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO machines (uuid, gym_id, name, machine_type, brand, model, load_kind, settings_notes, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now','localtime'))",
         params![
             uuid,
             gym_id,
@@ -564,6 +607,7 @@ pub fn add_machine(
             machine_type.trim(),
             normalize_machine_brand(brand)?,
             empty_to_none(model),
+            load_kind.map(MachineLoadKind::as_str),
             empty_to_none(settings_notes)
         ],
     )?;
@@ -577,10 +621,10 @@ pub fn list_machines(
 ) -> Result<Vec<Machine>> {
     require_existing_gym(conn, gym_id)?;
     let sql = if include_archived {
-        "SELECT id, uuid, gym_id, name, machine_type, brand, model, settings_notes, created_at, archived_at
+        "SELECT id, uuid, gym_id, name, machine_type, brand, model, load_kind, settings_notes, created_at, archived_at
          FROM machines WHERE gym_id = ?1 ORDER BY name"
     } else {
-        "SELECT id, uuid, gym_id, name, machine_type, brand, model, settings_notes, created_at, archived_at
+        "SELECT id, uuid, gym_id, name, machine_type, brand, model, load_kind, settings_notes, created_at, archived_at
          FROM machines WHERE gym_id = ?1 AND archived_at IS NULL ORDER BY name"
     };
     let mut stmt = conn.prepare(sql)?;
@@ -623,7 +667,8 @@ pub fn add_machine_note(conn: &Connection, machine_id: i64, note: &str) -> Resul
     }
     require_text(note, "machine note")?;
     conn.execute(
-        "INSERT INTO machine_notes (machine_id, note) VALUES (?1, ?2)",
+        "INSERT INTO machine_notes (machine_id, note, created_at)
+         VALUES (?1, ?2, datetime('now','localtime'))",
         params![machine_id, note.trim()],
     )?;
     get_machine_note(conn, conn.last_insert_rowid())
@@ -666,7 +711,8 @@ pub fn add_exercise(
     let slug = unique_slug(conn, "exercises", name)?;
     let tx = conn.transaction()?;
     tx.execute(
-        "INSERT INTO exercises (name, slug, kind, description) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO exercises (name, slug, kind, description, created_at)
+         VALUES (?1, ?2, ?3, ?4, datetime('now','localtime'))",
         params![name.trim(), slug, kind.as_str(), empty_to_none(description)],
     )?;
     let id = tx.last_insert_rowid();
@@ -871,6 +917,11 @@ pub fn suggest_machines_for_gym(
                         .as_deref()
                         .and_then(|brand| fuzzy_score(trimmed, brand))
                 })
+                .or_else(|| {
+                    machine
+                        .load_kind
+                        .and_then(|load_kind| fuzzy_score(trimmed, load_kind.as_str()))
+                })
         };
         if let Some(score) = score {
             scored.push((
@@ -881,6 +932,7 @@ pub fn suggest_machines_for_gym(
                     machine_type: machine.machine_type,
                     brand: machine.brand,
                     model: machine.model,
+                    load_kind: machine.load_kind,
                 },
             ));
         }
@@ -910,7 +962,8 @@ pub fn start_session(conn: &Connection, gym_id: i64, notes: Option<&str>) -> Res
     require_active_gym(conn, gym_id)?;
     let uuid = Uuid::new_v4().to_string();
     conn.execute(
-        "INSERT INTO sessions (uuid, gym_id, notes) VALUES (?1, ?2, ?3)",
+        "INSERT INTO sessions (uuid, gym_id, notes, started_at)
+         VALUES (?1, ?2, ?3, datetime('now','localtime'))",
         params![uuid, gym_id, empty_to_none(notes)],
     )
     .map_err(|err| {
@@ -936,7 +989,7 @@ pub fn finish_session(conn: &Connection, notes: Option<&str>) -> Result<Session>
         )?;
     }
     conn.execute(
-        "UPDATE sessions SET finished_at = datetime('now') WHERE id = ?1",
+        "UPDATE sessions SET finished_at = datetime('now','localtime') WHERE id = ?1",
         [active.row_id],
     )?;
     get_session_by_row_id(conn, active.row_id)
@@ -1129,8 +1182,8 @@ pub fn log_exercise(
         |row| row.get(0),
     )?;
     conn.execute(
-        "INSERT INTO session_exercises (session_id, exercise_id, machine_id, position, notes)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO session_exercises (session_id, exercise_id, machine_id, position, notes, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, datetime('now','localtime'))",
         params![
             active.row_id,
             exercise_id,
@@ -1198,8 +1251,8 @@ pub fn log_set(
         |row| row.get(0),
     )?;
     conn.execute(
-        "INSERT INTO sets (session_exercise_id, position, weight_value, weight_unit, reps)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO sets (session_exercise_id, position, weight_value, weight_unit, reps, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, datetime('now','localtime'))",
         params![
             session_exercise_id,
             position,
@@ -1209,6 +1262,37 @@ pub fn log_set(
         ],
     )?;
     get_set(conn, conn.last_insert_rowid())
+}
+
+pub fn exercise_history(
+    conn: &Connection,
+    exercise_id: i64,
+    limit: usize,
+) -> Result<Vec<HistoryEntry>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT se.id, s.uuid, s.started_at, g.name, m.name
+         FROM session_exercises se
+         JOIN sessions s ON s.id = se.session_id
+         JOIN gyms g ON g.id = s.gym_id
+         LEFT JOIN machines m ON m.id = se.machine_id
+         WHERE se.exercise_id = ?1
+           AND s.finished_at IS NOT NULL
+         ORDER BY s.started_at DESC, se.position DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![exercise_id, limit as i64], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(4)?,
+        ))
+    })?;
+    history_entries_from_rows(conn, rows)
 }
 
 fn get_gym(conn: &Connection, id: i64) -> Result<Gym> {
@@ -1311,8 +1395,8 @@ fn import_machine_tx(
     require_text(&machine.machine_type, "machine type")?;
     tx.execute(
         "INSERT INTO machines
-            (uuid, gym_id, name, machine_type, brand, model, settings_notes, created_at, archived_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            (uuid, gym_id, name, machine_type, brand, model, load_kind, settings_notes, created_at, archived_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             machine_uuid,
             gym_id,
@@ -1320,6 +1404,7 @@ fn import_machine_tx(
             machine.machine_type.trim(),
             normalize_machine_brand(machine.brand.as_deref())?,
             machine.model,
+            machine.load_kind.map(MachineLoadKind::as_str),
             machine.settings_notes,
             machine.created_at,
             machine.archived_at
@@ -1347,7 +1432,7 @@ fn machine_note_text_exists_tx(
 
 fn get_machine(conn: &Connection, id: i64) -> Result<Machine> {
     conn.query_row(
-        "SELECT id, uuid, gym_id, name, machine_type, brand, model, settings_notes, created_at, archived_at
+        "SELECT id, uuid, gym_id, name, machine_type, brand, model, load_kind, settings_notes, created_at, archived_at
          FROM machines WHERE id = ?1",
         [id],
         map_machine,
@@ -1480,6 +1565,16 @@ fn previous_history(
             ))
         },
     )?;
+    history_entries_from_rows(conn, rows)
+}
+
+fn history_entries_from_rows(
+    conn: &Connection,
+    rows: rusqlite::MappedRows<
+        '_,
+        impl FnMut(&Row<'_>) -> rusqlite::Result<(i64, String, String, String, Option<String>)>,
+    >,
+) -> Result<Vec<HistoryEntry>> {
     let mut entries = Vec::new();
     for row in rows {
         let (session_exercise_id, session_id, session_date, gym_name, machine_name) = row?;
@@ -1642,7 +1737,7 @@ fn require_existing_gym(conn: &Connection, gym_id: i64) -> Result<()> {
 
 fn set_archive(conn: &Connection, table: &str, id: i64, archive: bool) -> Result<()> {
     let sql = if archive {
-        format!("UPDATE {table} SET archived_at = datetime('now') WHERE id = ?1")
+        format!("UPDATE {table} SET archived_at = datetime('now','localtime') WHERE id = ?1")
     } else {
         format!("UPDATE {table} SET archived_at = NULL WHERE id = ?1")
     };
@@ -1816,9 +1911,14 @@ fn map_machine(row: &Row<'_>) -> rusqlite::Result<Machine> {
         machine_type: row.get(4)?,
         brand: row.get(5)?,
         model: row.get(6)?,
-        settings_notes: row.get(7)?,
-        created_at: row.get(8)?,
-        archived_at: row.get(9)?,
+        load_kind: row
+            .get::<_, Option<String>>(7)?
+            .map(|value| MachineLoadKind::from_str(&value))
+            .transpose()
+            .map_err(to_sql_error)?,
+        settings_notes: row.get(8)?,
+        created_at: row.get(9)?,
+        archived_at: row.get(10)?,
     })
 }
 
@@ -1928,7 +2028,7 @@ mod tests {
                 slug TEXT NOT NULL UNIQUE,
                 address TEXT,
                 notes TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
                 archived_at TEXT
             );
             CREATE TABLE machines (
@@ -1939,7 +2039,7 @@ mod tests {
                 brand TEXT,
                 model TEXT,
                 settings_notes TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
                 archived_at TEXT
             );
             INSERT INTO gyms (id, name, slug) VALUES (1, 'Main', 'main');
@@ -1965,6 +2065,7 @@ mod tests {
             gym_b.id,
             "Leg Press",
             "leg-press",
+            None,
             None,
             None,
             None,
@@ -2151,6 +2252,7 @@ mod tests {
             gym.id,
             "Leg Press A",
             "leg-press",
+            None,
             None,
             None,
             None,

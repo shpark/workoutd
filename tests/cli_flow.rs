@@ -350,6 +350,165 @@ fn session_import_restores_exported_session_json() {
 }
 
 #[test]
+fn html_export_renders_session_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let input_path = dir.path().join("session.json");
+    fs::write(
+        &input_path,
+        r#"{
+  "session": {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "gym_id": 1,
+    "gym_name": "Main Gym",
+    "started_at": "2026-05-16 10:00:00",
+    "finished_at": "2026-05-16 11:00:00",
+    "notes": "Push <heavy>"
+  },
+  "exercises": [
+    {
+      "entry": {
+        "id": 1,
+        "session_id": "550e8400-e29b-41d4-a716-446655440000",
+        "exercise_id": 1,
+        "exercise_name": "Bench & Press",
+        "kind": "freeweight",
+        "machine_id": null,
+        "machine_name": null,
+        "position": 1,
+        "notes": null,
+        "created_at": "2026-05-16 10:05:00"
+      },
+      "machine": null,
+      "sets": [
+        {
+          "id": 1,
+          "session_exercise_id": 1,
+          "position": 1,
+          "weight_value": 100,
+          "weight_unit": "kg",
+          "reps": 5,
+          "created_at": "2026-05-16 10:06:00"
+        }
+      ],
+      "machine_notes": []
+    }
+  ]
+}"#,
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("workoutd-html")
+        .unwrap()
+        .args([
+            "--input",
+            input_path.to_str().unwrap(),
+            "--timezone",
+            "Asia/Seoul",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let html = String::from_utf8(output).unwrap();
+
+    assert!(html.contains("<!doctype html>"));
+    assert!(html.contains("Bench &amp; Press"));
+    assert!(html.contains("Push &lt;heavy&gt;"));
+    assert!(html.contains("Asia/Seoul"));
+    assert!(html.contains("100 kg"));
+}
+
+#[test]
+fn html_export_renders_exercise_history_chart() {
+    let app = TestApp::new();
+
+    let gym = app.json(&["gym", "add", "--name", "Main Gym"]);
+    let gym_id = gym["id"].as_i64().unwrap();
+    let exercise = app.json(&[
+        "exercise",
+        "add",
+        "--name",
+        "Bench Press",
+        "--kind",
+        "freeweight",
+        "--tag",
+        "chest",
+    ]);
+    let exercise_id = exercise["id"].as_i64().unwrap();
+
+    app.cmd()
+        .args(["session", "start", "--gym", &gym_id.to_string()])
+        .assert()
+        .success();
+    let first_entry = app.json(&["log", "exercise", &exercise_id.to_string()]);
+    let first_entry_id = first_entry["entry"]["id"].as_i64().unwrap();
+    app.cmd()
+        .args([
+            "log",
+            "set",
+            "--exercise-entry",
+            &first_entry_id.to_string(),
+            "--reps",
+            "5",
+            "--weight",
+            "100",
+            "--unit",
+            "kg",
+        ])
+        .assert()
+        .success();
+    app.cmd().args(["session", "finish"]).assert().success();
+
+    app.cmd()
+        .args(["session", "start", "--gym", &gym_id.to_string()])
+        .assert()
+        .success();
+    let second_entry = app.json(&["log", "exercise", &exercise_id.to_string()]);
+    let second_entry_id = second_entry["entry"]["id"].as_i64().unwrap();
+    app.cmd()
+        .args([
+            "log",
+            "set",
+            "--exercise-entry",
+            &second_entry_id.to_string(),
+            "--reps",
+            "8",
+            "--weight",
+            "105",
+            "--unit",
+            "kg",
+        ])
+        .assert()
+        .success();
+    app.cmd().args(["session", "finish"]).assert().success();
+
+    let output = Command::cargo_bin("workoutd-html")
+        .unwrap()
+        .env("WORKOUTD_DB", &app.db)
+        .args([
+            "--exercise-history",
+            "Bench Press",
+            "--timezone",
+            "Asia/Seoul",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let html = String::from_utf8(output).unwrap();
+
+    assert!(html.contains("Exercise history"));
+    assert!(html.contains("Volume and max weight by session"));
+    assert!(html.contains("Bench Press"));
+    assert!(html.contains("history-chart"));
+    assert!(html.contains("chart-legend"));
+    assert!(html.contains("500 kg-reps"));
+    assert!(html.contains("105 kg"));
+}
+
+#[test]
 fn gym_names_resolve_exactly_and_suggest_fuzzy_matches() {
     let app = TestApp::new();
 
@@ -409,9 +568,12 @@ fn machine_brand_presets_are_discoverable_and_canonicalized() {
         "leg-press",
         "--brand",
         "hammer strength",
+        "--load-kind",
+        "plate-loaded",
     ]);
 
     assert_eq!(machine["brand"], "Hammer Strength");
+    assert_eq!(machine["load_kind"], "plate-loaded");
 
     let newtech = app.json(&[
         "machine",
@@ -424,8 +586,11 @@ fn machine_brand_presets_are_discoverable_and_canonicalized() {
         "chest-press",
         "--brand",
         "newtech",
+        "--load-kind",
+        "pin-loaded",
     ]);
     assert_eq!(newtech["brand"], "Newtech Wellness");
+    assert_eq!(newtech["load_kind"], "pin-loaded");
 }
 
 #[test]
@@ -524,6 +689,8 @@ fn machine_logging_suggests_only_active_gym_machines_and_shows_notes() {
         "Leg Press A",
         "--type",
         "leg-press",
+        "--load-kind",
+        "plate-loaded",
     ]);
     let active_machine_uuid = active_machine["uuid"].as_str().unwrap().to_string();
     app.json(&[
@@ -569,6 +736,7 @@ fn machine_logging_suggests_only_active_gym_machines_and_shows_notes() {
     assert_eq!(lookup.as_array().unwrap().len(), 1);
     assert_eq!(lookup[0]["uuid"], active_machine_uuid);
     assert_eq!(lookup[0]["name"], "Leg Press A");
+    assert_eq!(lookup[0]["load_kind"], "plate-loaded");
 
     app.cmd()
         .args([
