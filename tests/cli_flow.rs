@@ -177,8 +177,14 @@ fn session_export_outputs_full_session_json() {
         "Leg Press",
         "--type",
         "leg-press",
+        "--brand",
+        "Hammer Strength",
     ]);
-    let machine_id = machine["id"].as_i64().unwrap();
+    let machine_uuid = machine["uuid"].as_str().unwrap().to_string();
+    app.cmd()
+        .args(["machine", "note", "add", &machine_uuid, "--note", "pin 90"])
+        .assert()
+        .success();
     let exercise = app.json(&[
         "exercise",
         "add",
@@ -197,9 +203,7 @@ fn session_export_outputs_full_session_json() {
         "exercise",
         &exercise_id.to_string(),
         "--machine",
-        &machine_id.to_string(),
-        "--machine-note",
-        "pin 90",
+        &machine_uuid,
     ]);
     let entry_id = entry["entry"]["id"].as_i64().unwrap();
     app.cmd()
@@ -235,11 +239,94 @@ fn session_export_outputs_full_session_json() {
         exported["exercises"][0]["entry"]["exercise_name"],
         "Leg Press"
     );
+    assert_eq!(
+        exported["exercises"][0]["machine"]["brand"],
+        "Hammer Strength"
+    );
     assert_eq!(exported["exercises"][0]["sets"][0]["reps"], 10);
     assert_eq!(
         exported["exercises"][0]["machine_notes"][0]["note"],
         "pin 90"
     );
+}
+
+#[test]
+fn gym_names_resolve_exactly_and_suggest_fuzzy_matches() {
+    let app = TestApp::new();
+
+    app.json(&["gym", "add", "--name", "Main Gym"]);
+
+    app.cmd()
+        .args(["session", "start", "--gym", "Main Gym"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("started session"));
+    app.cmd().args(["session", "cancel"]).assert().success();
+
+    app.cmd()
+        .args([
+            "machine",
+            "add",
+            "--gym",
+            "main-gym",
+            "--name",
+            "Cable Stack",
+            "--type",
+            "cable",
+        ])
+        .assert()
+        .success();
+
+    app.cmd()
+        .args(["session", "start", "--gym", "main"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("similar gyms"))
+        .stderr(predicate::str::contains("Main Gym"));
+}
+
+#[test]
+fn machine_brand_presets_are_discoverable_and_canonicalized() {
+    let app = TestApp::new();
+
+    app.cmd()
+        .args(["machine", "brand", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Hammer Strength"))
+        .stdout(predicate::str::contains("Newtech Wellness"))
+        .stdout(predicate::str::contains("Technogym"));
+
+    let gym = app.json(&["gym", "add", "--name", "Main Gym"]);
+    let gym_id = gym["id"].as_i64().unwrap();
+    let machine = app.json(&[
+        "machine",
+        "add",
+        "--gym",
+        &gym_id.to_string(),
+        "--name",
+        "Leg Press",
+        "--type",
+        "leg-press",
+        "--brand",
+        "hammer strength",
+    ]);
+
+    assert_eq!(machine["brand"], "Hammer Strength");
+
+    let newtech = app.json(&[
+        "machine",
+        "add",
+        "--gym",
+        &gym_id.to_string(),
+        "--name",
+        "Chest Press",
+        "--type",
+        "chest-press",
+        "--brand",
+        "newtech",
+    ]);
+    assert_eq!(newtech["brand"], "Newtech Wellness");
 }
 
 #[test]
@@ -290,7 +377,7 @@ fn machine_exercise_rejects_machine_from_other_gym() {
         "--type",
         "leg-press",
     ]);
-    let machine_id = machine["id"].as_i64().unwrap();
+    let machine_uuid = machine["uuid"].as_str().unwrap().to_string();
 
     let exercise = app.json(&[
         "exercise",
@@ -313,7 +400,7 @@ fn machine_exercise_rejects_machine_from_other_gym() {
             "exercise",
             &exercise_id.to_string(),
             "--machine",
-            &machine_id.to_string(),
+            &machine_uuid,
         ])
         .assert()
         .failure()
@@ -339,7 +426,7 @@ fn machine_logging_suggests_only_active_gym_machines_and_shows_notes() {
         "--type",
         "leg-press",
     ]);
-    let active_machine_id = active_machine["id"].as_i64().unwrap();
+    let active_machine_uuid = active_machine["uuid"].as_str().unwrap().to_string();
     app.json(&[
         "machine",
         "add",
@@ -355,7 +442,7 @@ fn machine_logging_suggests_only_active_gym_machines_and_shows_notes() {
             "machine",
             "note",
             "add",
-            &active_machine_id.to_string(),
+            &active_machine_uuid,
             "--note",
             "seat 4",
         ])
@@ -379,6 +466,11 @@ fn machine_logging_suggests_only_active_gym_machines_and_shows_notes() {
         .assert()
         .success();
 
+    let lookup = app.json(&["machine", "lookup", "--gym", &gym_a_id.to_string(), "press"]);
+    assert_eq!(lookup.as_array().unwrap().len(), 1);
+    assert_eq!(lookup[0]["uuid"], active_machine_uuid);
+    assert_eq!(lookup[0]["name"], "Leg Press A");
+
     app.cmd()
         .args([
             "log",
@@ -389,8 +481,7 @@ fn machine_logging_suggests_only_active_gym_machines_and_shows_notes() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Leg Press A"))
-        .stderr(predicate::str::contains("Leg Press B").not());
+        .stderr(predicate::str::contains("requires a machine UUID"));
 
     app.cmd()
         .args([
@@ -398,17 +489,15 @@ fn machine_logging_suggests_only_active_gym_machines_and_shows_notes() {
             "exercise",
             &exercise_id.to_string(),
             "--machine",
-            "Leg Press A",
-            "--machine-note",
-            "pin 90",
+            &active_machine_uuid,
         ])
         .assert()
         .success()
         .stdout(predicate::str::contains("machine notes"))
         .stdout(predicate::str::contains("seat 4"));
 
-    let notes = app.json(&["machine", "note", "list", &active_machine_id.to_string()]);
-    assert_eq!(notes.as_array().unwrap().len(), 2);
+    let notes = app.json(&["machine", "note", "list", &active_machine_uuid]);
+    assert_eq!(notes.as_array().unwrap().len(), 1);
 }
 
 #[test]

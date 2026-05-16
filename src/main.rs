@@ -6,11 +6,12 @@ use std::str::FromStr;
 use workoutd::{
     add_exercise, add_gym, add_machine, add_machine_note, archive_exercise, archive_gym,
     archive_machine, archive_machine_note, cancel_session, current_session, default_db_path,
-    delete_session, export_session, find_exercise_exact, find_machine_exact_for_gym,
-    finish_session, latest_session_exercise_id, list_allowed_tags, list_exercises, list_gyms,
-    list_machine_notes, list_machines, list_sessions, log_exercise, log_set, open_database,
-    restore_exercise, restore_gym, restore_machine, restore_machine_note, start_session,
-    suggest_exercises, suggest_machines_for_gym, update_exercise, ExerciseKind, ExerciseSuggestion,
+    delete_session, export_session, find_exercise_exact, find_gym_exact, find_machine_by_uuid,
+    find_machine_uuid_for_gym, finish_session, latest_session_exercise_id, list_allowed_tags,
+    list_exercises, list_gyms, list_machine_notes, list_machines, list_preset_machine_brands,
+    list_sessions, log_exercise, log_set, open_database, restore_exercise, restore_gym,
+    restore_machine, restore_machine_note, start_session, suggest_exercises, suggest_gyms,
+    suggest_machines_for_gym, update_exercise, ExerciseKind, ExerciseSuggestion, GymSuggestion,
     HistoryEntry, LogExerciseResult, MachineNote, MachineSuggestion, Session, SetEntry, WeightUnit,
 };
 
@@ -88,6 +89,13 @@ enum MachineCommand {
     Add(MachineAdd),
     #[command(about = "List machines at a gym")]
     List(MachineList),
+    #[command(about = "Look up machine UUIDs by gym and search text")]
+    Lookup(MachineLookup),
+    #[command(about = "List preset machine brands")]
+    Brand {
+        #[command(subcommand)]
+        command: MachineBrandCommand,
+    },
     #[command(about = "Add, list, archive, or restore machine notes")]
     Note {
         #[command(subcommand)]
@@ -102,7 +110,7 @@ enum MachineCommand {
 #[derive(Args)]
 struct MachineAdd {
     #[arg(long)]
-    gym: i64,
+    gym: String,
     #[arg(long)]
     name: String,
     #[arg(long = "type")]
@@ -118,9 +126,24 @@ struct MachineAdd {
 #[derive(Args)]
 struct MachineList {
     #[arg(long)]
-    gym: i64,
+    gym: String,
     #[arg(long)]
     include_archived: bool,
+}
+
+#[derive(Args)]
+struct MachineLookup {
+    #[arg(long)]
+    gym: String,
+    query: String,
+    #[arg(long, default_value_t = 5)]
+    limit: usize,
+}
+
+#[derive(Subcommand)]
+enum MachineBrandCommand {
+    #[command(about = "Print preset machine brands")]
+    List,
 }
 
 #[derive(Subcommand)]
@@ -137,14 +160,14 @@ enum MachineNoteCommand {
 
 #[derive(Args)]
 struct MachineNoteAdd {
-    machine: i64,
+    machine: String,
     #[arg(long)]
     note: String,
 }
 
 #[derive(Args)]
 struct MachineNoteList {
-    machine: i64,
+    machine: String,
     #[arg(long)]
     include_archived: bool,
 }
@@ -230,7 +253,7 @@ enum SessionCommand {
 #[derive(Args)]
 struct SessionStart {
     #[arg(long)]
-    gym: i64,
+    gym: String,
     #[arg(long)]
     notes: Option<String>,
 }
@@ -275,14 +298,11 @@ enum LogCommand {
 struct LogExercise {
     /// Exercise id, exact name, or exact slug. Non-exact matches print suggestions and abort.
     exercise: String,
-    /// Machine id or exact machine name, scoped to the active session gym.
+    /// Machine UUID, scoped to the active session gym. Use `workoutd machine lookup` to find it.
     #[arg(long)]
     machine: Option<String>,
     #[arg(long)]
     notes: Option<String>,
-    /// Save machine settings or setup notes with this machine exercise entry.
-    #[arg(long = "machine-note")]
-    machine_note: Option<String>,
     #[arg(long, default_value_t = 1)]
     history: usize,
 }
@@ -359,9 +379,10 @@ fn main() -> Result<()> {
         },
         Command::Machine { command } => match command {
             MachineCommand::Add(args) => {
+                let gym = resolve_active_gym_or_suggest(&conn, &args.gym)?;
                 let machine = add_machine(
                     &conn,
-                    args.gym,
+                    gym.id,
                     &args.name,
                     &args.machine_type,
                     args.brand.as_deref(),
@@ -369,39 +390,57 @@ fn main() -> Result<()> {
                     args.settings_notes.as_deref(),
                 )?;
                 emit(cli.json, &machine, || {
-                    println!("added machine {} ({})", machine.id, machine.name);
+                    println!("added machine {} ({})", machine.uuid, machine.name);
                     Ok(())
                 })
             }
-            MachineCommand::List(args) => emit(
-                cli.json,
-                &list_machines(&conn, args.gym, args.include_archived)?,
-                || {
-                    for machine in list_machines(&conn, args.gym, args.include_archived)? {
+            MachineCommand::List(args) => {
+                let gym = resolve_existing_gym_or_suggest(&conn, &args.gym)?;
+                let machines = list_machines(&conn, gym.id, args.include_archived)?;
+                emit(cli.json, &machines, || {
+                    for machine in &machines {
                         println!(
                             "{}: {} [{}]{}",
-                            machine.id,
+                            machine.uuid,
                             machine.name,
                             machine.machine_type,
                             archived_suffix(&machine.archived_at)
                         );
                     }
                     Ok(())
-                },
-            ),
+                })
+            }
+            MachineCommand::Lookup(args) => {
+                let gym = resolve_existing_gym_or_suggest(&conn, &args.gym)?;
+                let machines = suggest_machines_for_gym(&conn, gym.id, &args.query, args.limit)?;
+                emit(cli.json, &machines, || print_machine_suggestions(&machines))
+            }
+            MachineCommand::Brand { command } => match command {
+                MachineBrandCommand::List => {
+                    let brands = list_preset_machine_brands();
+                    emit(cli.json, &brands, || {
+                        for brand in &brands {
+                            println!("{brand}");
+                        }
+                        Ok(())
+                    })
+                }
+            },
             MachineCommand::Note { command } => match command {
                 MachineNoteCommand::Add(args) => {
-                    let note = add_machine_note(&conn, args.machine, &args.note, None)?;
+                    let machine = resolve_machine_uuid(&conn, &args.machine)?;
+                    let note = add_machine_note(&conn, machine.id, &args.note)?;
                     emit(cli.json, &note, || {
                         println!(
                             "added machine note {} for machine {}",
-                            note.id, note.machine_id
+                            note.id, machine.uuid
                         );
                         Ok(())
                     })
                 }
                 MachineNoteCommand::List(args) => {
-                    let notes = list_machine_notes(&conn, args.machine, args.include_archived)?;
+                    let machine = resolve_machine_uuid(&conn, &args.machine)?;
+                    let notes = list_machine_notes(&conn, machine.id, args.include_archived)?;
                     emit(cli.json, &notes, || print_machine_notes(&notes))
                 }
                 MachineNoteCommand::Archive(args) => {
@@ -524,7 +563,8 @@ fn main() -> Result<()> {
         },
         Command::Session { command } => match command {
             SessionCommand::Start(args) => {
-                let session = start_session(&conn, args.gym, args.notes.as_deref())?;
+                let gym = resolve_active_gym_or_suggest(&conn, &args.gym)?;
+                let session = start_session(&conn, gym.id, args.notes.as_deref())?;
                 emit(cli.json, &session, || {
                     println!("started session {} at {}", session.id, session.gym_name);
                     Ok(())
@@ -587,7 +627,6 @@ fn main() -> Result<()> {
                     exercise.id,
                     machine_id,
                     args.notes.as_deref(),
-                    args.machine_note.as_deref(),
                     args.history,
                 )?;
                 emit(cli.json, &result, || print_log_exercise(&result))
@@ -623,6 +662,45 @@ fn emit_status(json: bool, status: &'static str, id: i64) -> Result<()> {
         println!("{status}");
         Ok(())
     })
+}
+
+fn resolve_active_gym_or_suggest(
+    conn: &rusqlite::Connection,
+    query: &str,
+) -> Result<workoutd::Gym> {
+    if let Some(gym) = find_gym_exact(conn, query, true)? {
+        if gym.archived_at.is_some() {
+            bail!("gym '{}' is archived", gym.name);
+        }
+        return Ok(gym);
+    }
+    let suggestions = suggest_gyms(conn, query, false, 5)?;
+    if suggestions.is_empty() {
+        bail!("gym '{}' not found", query);
+    }
+    bail!(
+        "gym '{}' not found; similar gyms:\n{}",
+        query,
+        format_gym_suggestions(&suggestions)
+    );
+}
+
+fn resolve_existing_gym_or_suggest(
+    conn: &rusqlite::Connection,
+    query: &str,
+) -> Result<workoutd::Gym> {
+    if let Some(gym) = find_gym_exact(conn, query, true)? {
+        return Ok(gym);
+    }
+    let suggestions = suggest_gyms(conn, query, true, 5)?;
+    if suggestions.is_empty() {
+        bail!("gym '{}' not found", query);
+    }
+    bail!(
+        "gym '{}' not found; similar gyms:\n{}",
+        query,
+        format_gym_suggestions(&suggestions)
+    );
 }
 
 fn resolve_exercise_or_suggest(
@@ -672,24 +750,43 @@ fn resolve_machine_for_log(
     }
 
     let session = current_session(conn)?.ok_or_else(|| anyhow::anyhow!("no active session"))?;
-    if let Some(machine) = find_machine_exact_for_gym(conn, session.gym_id, query)? {
-        return Ok(Some(machine.id));
-    }
+    let machine = match find_machine_uuid_for_gym(conn, session.gym_id, query) {
+        Ok(Some(machine)) => machine,
+        Ok(None) => {
+            bail!(
+                "machine UUID '{}' not found in active gym {}; run `workoutd machine lookup --gym \"{}\" QUERY` to find a machine UUID",
+                query,
+                session.gym_name,
+                session.gym_name
+            );
+        }
+        Err(err) => {
+            bail!(
+                "{}; --machine requires a machine UUID from `workoutd machine lookup --gym \"{}\" QUERY`",
+                err,
+                session.gym_name
+            );
+        }
+    };
+    Ok(Some(machine.id))
+}
 
-    let suggestions = suggest_machines_for_gym(conn, session.gym_id, query, 5)?;
+fn resolve_machine_uuid(conn: &rusqlite::Connection, query: &str) -> Result<workoutd::Machine> {
+    find_machine_by_uuid(conn, query).map_err(|err| {
+        anyhow::anyhow!(
+            "{}; machine notes require a machine UUID from `workoutd machine lookup --gym GYM QUERY`",
+            err
+        )
+    })
+}
+
+fn print_machine_suggestions(suggestions: &[MachineSuggestion]) -> Result<()> {
     if suggestions.is_empty() {
-        bail!(
-            "machine '{}' not found in active gym {}",
-            query,
-            session.gym_name
-        );
+        println!("no machines");
+        return Ok(());
     }
-    bail!(
-        "machine '{}' not found in active gym {}; similar machines:\n{}",
-        query,
-        session.gym_name,
-        format_machine_suggestions(&suggestions)
-    );
+    println!("{}", format_machine_suggestions(suggestions));
+    Ok(())
 }
 
 fn format_exercise_suggestions(suggestions: &[ExerciseSuggestion]) -> String {
@@ -711,11 +808,29 @@ fn format_machine_suggestions(suggestions: &[MachineSuggestion]) -> String {
     suggestions
         .iter()
         .map(|machine| {
+            let brand = machine
+                .brand
+                .as_ref()
+                .map(|brand| format!(" brand={brand}"))
+                .unwrap_or_default();
+            let model = machine
+                .model
+                .as_ref()
+                .map(|model| format!(" model={model}"))
+                .unwrap_or_default();
             format!(
-                "- {}: {} [{}]",
-                machine.id, machine.name, machine.machine_type
+                "- {}: {} [{}]{}{}",
+                machine.uuid, machine.name, machine.machine_type, brand, model
             )
         })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_gym_suggestions(suggestions: &[GymSuggestion]) -> String {
+    suggestions
+        .iter()
+        .map(|gym| format!("- {}: {} ({})", gym.id, gym.name, gym.slug))
         .collect::<Vec<_>>()
         .join("\n")
 }
