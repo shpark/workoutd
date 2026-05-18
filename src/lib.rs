@@ -40,6 +40,7 @@ pub const PRESET_MACHINE_BRANDS: &[&str] = &[
     "Star Trac",
     "Technogym",
     "True Fitness",
+    "Watson Gym Equipment",
 ];
 
 const MACHINE_BRAND_ALIASES: &[(&str, &str)] = &[
@@ -47,6 +48,7 @@ const MACHINE_BRAND_ALIASES: &[(&str, &str)] = &[
     ("New Tech", "Newtech Wellness"),
     ("Neutech", "Newtech Wellness"),
     ("Neutech Wellness", "Newtech Wellness"),
+    ("Watson", "Watson Gym Equipment"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

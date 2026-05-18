@@ -553,7 +553,8 @@ fn machine_brand_presets_are_discoverable_and_canonicalized() {
         .success()
         .stdout(predicate::str::contains("Hammer Strength"))
         .stdout(predicate::str::contains("Newtech Wellness"))
-        .stdout(predicate::str::contains("Technogym"));
+        .stdout(predicate::str::contains("Technogym"))
+        .stdout(predicate::str::contains("Watson Gym Equipment"));
 
     let gym = app.json(&["gym", "add", "--name", "Main Gym"]);
     let gym_id = gym["id"].as_i64().unwrap();
@@ -591,6 +592,20 @@ fn machine_brand_presets_are_discoverable_and_canonicalized() {
     ]);
     assert_eq!(newtech["brand"], "Newtech Wellness");
     assert_eq!(newtech["load_kind"], "pin-loaded");
+
+    let watson = app.json(&[
+        "machine",
+        "add",
+        "--gym",
+        &gym_id.to_string(),
+        "--name",
+        "Hack Squat",
+        "--type",
+        "hack-squat",
+        "--brand",
+        "watson",
+    ]);
+    assert_eq!(watson["brand"], "Watson Gym Equipment");
 }
 
 #[test]
