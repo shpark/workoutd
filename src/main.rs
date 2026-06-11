@@ -11,10 +11,11 @@ use workoutd::{
     find_machine_uuid_for_gym, finish_session, import_session, latest_session_exercise_id,
     list_allowed_tags, list_exercises, list_gyms, list_machine_notes, list_machines,
     list_preset_machine_brands, list_sessions, log_exercise, log_set, open_database,
-    restore_exercise, restore_gym, restore_machine, restore_machine_note, start_session,
-    suggest_exercises, suggest_gyms, suggest_machines_for_gym, update_exercise, ExerciseKind,
-    ExerciseSuggestion, GymSuggestion, HistoryEntry, LogExerciseResult, MachineLoadKind,
-    MachineNote, MachineSuggestion, Session, SessionExport, SetEntry, WeightUnit,
+    recent_muscle_group_volume, restore_exercise, restore_gym, restore_machine,
+    restore_machine_note, start_session, suggest_exercises, suggest_gyms, suggest_machines_for_gym,
+    update_exercise, ExerciseKind, ExerciseSuggestion, GymSuggestion, HistoryEntry,
+    LogExerciseResult, MachineLoadKind, MachineNote, MachineSuggestion, MuscleGroupVolumeSummary,
+    Session, SessionExport, SetEntry, WeightUnit,
 };
 
 #[derive(Parser)]
@@ -242,6 +243,8 @@ enum SessionCommand {
     Start(SessionStart),
     #[command(about = "List sessions, optionally filtered by date")]
     List(SessionList),
+    #[command(about = "Summarize set volume by muscle group for recent completed sessions")]
+    Volume(SessionVolume),
     #[command(about = "Show the active session")]
     Current,
     #[command(about = "Export a full session as JSON")]
@@ -269,6 +272,13 @@ struct SessionList {
     /// Filter sessions by started date in YYYY-MM-DD format.
     #[arg(long)]
     date: Option<String>,
+}
+
+#[derive(Args)]
+struct SessionVolume {
+    /// Number of recent completed sessions to summarize.
+    #[arg(long, default_value_t = 3)]
+    sessions: usize,
 }
 
 #[derive(Args)]
@@ -597,6 +607,10 @@ fn main() -> Result<()> {
                 let sessions = list_sessions(&conn, args.date.as_deref())?;
                 emit(cli.json, &sessions, || print_sessions(&sessions))
             }
+            SessionCommand::Volume(args) => {
+                let summary = recent_muscle_group_volume(&conn, args.sessions)?;
+                emit(cli.json, &summary, || print_muscle_group_volume(&summary))
+            }
             SessionCommand::Current => {
                 let session = current_session(&conn)?;
                 emit(cli.json, &session, || {
@@ -909,6 +923,41 @@ fn print_sessions(sessions: &[Session]) -> Result<()> {
     Ok(())
 }
 
+fn print_muscle_group_volume(summary: &MuscleGroupVolumeSummary) -> Result<()> {
+    if summary.sessions.is_empty() {
+        println!("no completed sessions");
+        return Ok(());
+    }
+
+    println!(
+        "volume summary for latest {} completed sessions ({} found):",
+        summary.session_limit,
+        summary.sessions.len()
+    );
+    println!("sessions:");
+    for session in &summary.sessions {
+        println!(
+            "- {} at {} started {}",
+            session.id, session.gym_name, session.started_at
+        );
+    }
+
+    println!("muscle groups:");
+    if summary.muscle_groups.is_empty() {
+        println!("- no sets recorded");
+    } else {
+        for group in &summary.muscle_groups {
+            println!(
+                "- {}: {} {}",
+                group.muscle_group,
+                group.sets,
+                pluralize(group.sets, "set", "sets")
+            );
+        }
+    }
+    Ok(())
+}
+
 fn print_log_exercise(result: &LogExerciseResult) -> Result<()> {
     println!(
         "added session exercise {}: {}",
@@ -974,5 +1023,13 @@ fn archived_suffix(archived_at: &Option<String>) -> &'static str {
         " archived"
     } else {
         ""
+    }
+}
+
+fn pluralize(count: i64, singular: &'static str, plural: &'static str) -> &'static str {
+    if count == 1 {
+        singular
+    } else {
+        plural
     }
 }

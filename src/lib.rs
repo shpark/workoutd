@@ -231,6 +231,19 @@ pub struct HistoryEntry {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+pub struct MuscleGroupVolumeSummary {
+    pub session_limit: usize,
+    pub sessions: Vec<Session>,
+    pub muscle_groups: Vec<MuscleGroupVolume>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct MuscleGroupVolume {
+    pub muscle_group: String,
+    pub sets: i64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SessionExport {
     pub session: Session,
     pub exercises: Vec<SessionExerciseExport>,
@@ -1295,6 +1308,63 @@ pub fn exercise_history(
         ))
     })?;
     history_entries_from_rows(conn, rows)
+}
+
+pub fn recent_muscle_group_volume(
+    conn: &Connection,
+    session_limit: usize,
+) -> Result<MuscleGroupVolumeSummary> {
+    if session_limit == 0 {
+        return Ok(MuscleGroupVolumeSummary {
+            session_limit,
+            sessions: Vec::new(),
+            muscle_groups: Vec::new(),
+        });
+    }
+    let sql_limit = i64::try_from(session_limit).context("session count is too large")?;
+
+    let mut session_stmt = conn.prepare(
+        "SELECT s.id, s.uuid, s.gym_id, g.name, s.started_at, s.finished_at, s.notes
+         FROM sessions s JOIN gyms g ON g.id = s.gym_id
+         WHERE s.finished_at IS NOT NULL
+         ORDER BY s.started_at DESC, s.id DESC
+         LIMIT ?1",
+    )?;
+    let records = collect_rows(session_stmt.query_map([sql_limit], map_session_record)?)?;
+    let sessions = records
+        .into_iter()
+        .map(|record| record.session)
+        .collect::<Vec<_>>();
+
+    let mut volume_stmt = conn.prepare(
+        "WITH recent_sessions AS (
+             SELECT id
+             FROM sessions
+             WHERE finished_at IS NOT NULL
+             ORDER BY started_at DESC, id DESC
+             LIMIT ?1
+         )
+         SELECT COALESCE(t.name, 'untagged') AS muscle_group, COUNT(st.id) AS sets
+         FROM recent_sessions rs
+         JOIN session_exercises se ON se.session_id = rs.id
+         JOIN sets st ON st.session_exercise_id = se.id
+         LEFT JOIN exercise_tags et ON et.exercise_id = se.exercise_id
+         LEFT JOIN tags t ON t.id = et.tag_id
+         GROUP BY muscle_group
+         ORDER BY sets DESC, muscle_group",
+    )?;
+    let rows = volume_stmt.query_map([sql_limit], |row| {
+        Ok(MuscleGroupVolume {
+            muscle_group: row.get(0)?,
+            sets: row.get(1)?,
+        })
+    })?;
+
+    Ok(MuscleGroupVolumeSummary {
+        session_limit,
+        sessions,
+        muscle_groups: collect_rows(rows)?,
+    })
 }
 
 fn get_gym(conn: &Connection, id: i64) -> Result<Gym> {

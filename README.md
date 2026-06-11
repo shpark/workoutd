@@ -38,6 +38,8 @@ workoutd log set --reps 5 --weight 100 --unit kg
 workoutd log exercise "Leg Press" --machine MACHINE_UUID
 workoutd session finish
 workoutd session list --date 2026-05-15
+workoutd session volume
+workoutd session volume --sessions 5
 workoutd session export 550e8400-e29b-41d4-a716-446655440000
 workoutd session import session.json
 workoutd-html --input session.json --timezone Asia/Seoul --output session.html
@@ -85,7 +87,7 @@ workoutd machine note restore 1
 
 When logging a machine exercise, prior machine notes are printed with the usual exercise history.
 
-Session IDs are random UUIDs in CLI and JSON output. `workoutd session cancel` deletes the active unfinished session; `workoutd session list --date YYYY-MM-DD` finds sessions started on a date; `workoutd session export SESSION_UUID` prints a full JSON export with logged exercises, machine details including brand, sets, and machine notes; `workoutd session import PATH` restores a session JSON export and creates missing gym, exercise, and machine records as needed; `workoutd session delete SESSION_UUID --yes` deletes that session, including its logged exercises and sets.
+Session IDs are random UUIDs in CLI and JSON output. `workoutd session cancel` deletes the active unfinished session; `workoutd session list --date YYYY-MM-DD` finds sessions started on a date; `workoutd session volume` summarizes set counts by muscle group over the latest 3 completed sessions by default, or another count with `--sessions N`; `workoutd session export SESSION_UUID` prints a full JSON export with logged exercises, machine details including brand, sets, and machine notes; `workoutd session import PATH` restores a session JSON export and creates missing gym, exercise, and machine records as needed; `workoutd session delete SESSION_UUID --yes` deletes that session, including its logged exercises and sets.
 
 ## AI Agent Migration Guide
 

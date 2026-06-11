@@ -36,6 +36,29 @@ impl TestApp {
     }
 }
 
+fn completed_session_with_sets(app: &TestApp, gym_id: i64, exercise_id: i64, sets: usize) {
+    app.cmd()
+        .args(["session", "start", "--gym", &gym_id.to_string()])
+        .assert()
+        .success();
+    let entry = app.json(&["log", "exercise", &exercise_id.to_string()]);
+    let entry_id = entry["entry"]["id"].as_i64().unwrap();
+    for _ in 0..sets {
+        app.cmd()
+            .args([
+                "log",
+                "set",
+                "--exercise-entry",
+                &entry_id.to_string(),
+                "--reps",
+                "5",
+            ])
+            .assert()
+            .success();
+    }
+    app.cmd().args(["session", "finish"]).assert().success();
+}
+
 #[test]
 fn full_cli_flow_tracks_history() {
     let app = TestApp::new();
@@ -96,6 +119,74 @@ fn full_cli_flow_tracks_history() {
             .unwrap(),
         5
     );
+}
+
+#[test]
+fn session_volume_summarizes_default_recent_completed_sessions_by_muscle_group() {
+    let app = TestApp::new();
+
+    let gym = app.json(&["gym", "add", "--name", "Main Gym"]);
+    let gym_id = gym["id"].as_i64().unwrap();
+    let curl = app.json(&[
+        "exercise",
+        "add",
+        "--name",
+        "Curl",
+        "--kind",
+        "freeweight",
+        "--tag",
+        "biceps",
+    ]);
+    let bench = app.json(&[
+        "exercise",
+        "add",
+        "--name",
+        "Bench Press",
+        "--kind",
+        "freeweight",
+        "--tag",
+        "chest",
+        "--tag",
+        "triceps",
+    ]);
+    let squat = app.json(&[
+        "exercise",
+        "add",
+        "--name",
+        "Squat",
+        "--kind",
+        "freeweight",
+        "--tag",
+        "quad",
+        "--tag",
+        "glute",
+    ]);
+    let curl_id = curl["id"].as_i64().unwrap();
+    let bench_id = bench["id"].as_i64().unwrap();
+    let squat_id = squat["id"].as_i64().unwrap();
+
+    completed_session_with_sets(&app, gym_id, curl_id, 2);
+    completed_session_with_sets(&app, gym_id, bench_id, 1);
+    completed_session_with_sets(&app, gym_id, squat_id, 2);
+    completed_session_with_sets(&app, gym_id, bench_id, 2);
+
+    let summary = app.json(&["session", "volume"]);
+    assert_eq!(summary["session_limit"], 3);
+    assert_eq!(summary["sessions"].as_array().unwrap().len(), 3);
+    let groups = summary["muscle_groups"].as_array().unwrap();
+    assert_eq!(groups[0]["muscle_group"], "chest");
+    assert_eq!(groups[0]["sets"], 3);
+    assert_eq!(groups[1]["muscle_group"], "triceps");
+    assert_eq!(groups[1]["sets"], 3);
+    assert!(groups.iter().all(|group| group["muscle_group"] != "biceps"));
+
+    app.cmd()
+        .args(["session", "volume", "--sessions", "4"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("volume summary for latest 4"))
+        .stdout(predicate::str::contains("chest: 3 sets"))
+        .stdout(predicate::str::contains("biceps: 2 sets"));
 }
 
 #[test]
